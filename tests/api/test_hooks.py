@@ -93,6 +93,13 @@ def test_an_asset_without_a_capture_date_is_still_parsed():
     assert asset_from_webhook(body).taken_at is None
 
 
+def test_starred_state_is_parsed_from_the_webhook():
+    assert asset_from_webhook(payload(B64)).is_favorite is False
+    starred = payload(B64)
+    starred["data"]["asset"]["isFavorite"] = True
+    assert asset_from_webhook(starred).is_favorite is True
+
+
 def test_asset_is_parsed_from_a_buffer_shaped_checksum():
     """The Wasm runtime types checksum as Buffer; its JSON form is unverified."""
     asset = asset_from_webhook(payload({"type": "Buffer", "data": list(RAW)}))

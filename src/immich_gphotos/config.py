@@ -75,6 +75,7 @@ class Settings:
     reconcile_overlap: timedelta = timedelta(minutes=5)
     albums_enabled: bool = True
     deletions_enabled: bool = False
+    favorites_enabled: bool = True
     window: Window | None = None
     bandwidth_bytes_per_second: int | None = None
     filters: Filters = field(default_factory=Filters)

@@ -30,6 +30,7 @@ def _row_to_stored(row: sqlite3.Row) -> StoredAsset:
         is_offline=bool(row["is_offline"]),
         is_trashed=bool(row["is_trashed"]),
         tags=tuple(json.loads(row["tags"])),
+        is_favorite=bool(row["is_favorite"]),
     )
     return StoredAsset(
         asset=asset,
@@ -42,6 +43,7 @@ def _row_to_stored(row: sqlite3.Row) -> StoredAsset:
         error_class=ErrorClass(row["error_class"]) if row["error_class"] else None,
         last_error=row["last_error"],
         ineligible_reason=row["ineligible_reason"],
+        favorite_synced=bool(row["favorite_synced"]) if row["favorite_synced"] is not None else None,
     )
 
 
@@ -79,8 +81,8 @@ class AssetRepo:
             row = self._conn.execute(
                 "INSERT INTO asset (immich_id, checksum, filename, type, size_bytes,"
                 " immich_updated_at, taken_at, original_path, visibility, is_offline, is_trashed,"
-                " tags, state, priority, first_seen_at)"
-                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+                " tags, is_favorite, state, priority, first_seen_at)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
                 " ON CONFLICT(immich_id) DO UPDATE SET"
                 "  state = CASE"
                 "    WHEN state = ? AND ineligible_reason = ? THEN ?"
@@ -100,6 +102,7 @@ class AssetRepo:
                 "  visibility = excluded.visibility,"
                 "  immich_updated_at = excluded.immich_updated_at,"
                 "  is_offline = excluded.is_offline,"
+                "  is_favorite = excluded.is_favorite,"
                 "  tags = excluded.tags"
                 " RETURNING state",
                 (
@@ -115,6 +118,7 @@ class AssetRepo:
                     int(asset.is_offline),
                     int(asset.is_trashed),
                     json.dumps(list(asset.tags)),
+                    int(asset.is_favorite),
                     AssetState.PENDING.value,
                     int(priority),
                     now,
@@ -328,3 +332,33 @@ class AssetRepo:
                 (AssetState.PENDING.value, AssetState.UPLOADING.value, cutoff),
             )
             return cur.rowcount
+
+    def mark_favorite_synced(self, immich_id: str, is_favorite: bool) -> None:
+        """Record that Google now agrees with Immich about starring.
+
+        Only ever written after a successful `set_favorite` call -- never
+        alongside the desired `is_favorite` itself -- so the gap between the
+        two columns is exactly the drift `favorite_drift` looks for.
+        """
+        with self._conn.lock:
+            self._conn.execute(
+                "UPDATE asset SET favorite_synced = ? WHERE immich_id = ?",
+                (int(is_favorite), immich_id),
+            )
+
+    def favorite_drift(self, limit: int = 500) -> list[StoredAsset]:
+        """SYNCED rows whose star no longer matches what Google was told.
+
+        `favorite_synced IS NULL` covers both never-pushed rows and databases
+        from before the column existed; `!= is_favorite` covers a star added
+        or removed in Immich after the last push. Only rows with a `media_key`
+        can be pushed -- without one there is nothing in Google to star.
+        """
+        with self._conn.lock:
+            rows = self._conn.execute(
+                "SELECT * FROM asset WHERE state = ? AND media_key IS NOT NULL"
+                " AND (favorite_synced IS NULL OR favorite_synced != is_favorite)"
+                " ORDER BY first_seen_at ASC LIMIT ?",
+                (AssetState.SYNCED.value, limit),
+            ).fetchall()
+        return [_row_to_stored(r) for r in rows]

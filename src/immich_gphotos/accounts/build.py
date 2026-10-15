@@ -65,6 +65,7 @@ _SETTINGS_KEYS = (
     "quality",
     "albums_enabled",
     "deletions_enabled",
+    "favorites_enabled",
     "worker_threads",
     "bandwidth_bytes_per_second",
 )
@@ -83,7 +84,7 @@ def _validated(key: str, value: object) -> object | None:
     """
     if key == "quality":
         return value if isinstance(value, str) and value in _QUALITIES else None
-    if key in ("albums_enabled", "deletions_enabled"):
+    if key in ("albums_enabled", "deletions_enabled", "favorites_enabled"):
         return value if isinstance(value, bool) else None
     if key == "worker_threads":
         if (

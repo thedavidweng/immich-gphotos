@@ -33,6 +33,7 @@ class BackgroundLoops:
         clock: Clock,
         events: EventRepo,
         assets=None,  # noqa: ANN001 - AssetRepo; only needed for the periodic stale-upload sweep
+        favorite_syncer=None,  # noqa: ANN001 - sync.favorites.FavoriteSyncer; None keeps old call sites working
     ) -> None:
         self._runtime = runtime
         self._reconciler = reconciler
@@ -43,6 +44,7 @@ class BackgroundLoops:
         self._clock = clock
         self._events = events
         self._assets = assets
+        self._favorite_syncer = favorite_syncer
         self._next_reconcile: datetime | None = None
         self._paused_at: datetime | None = None
 
@@ -91,6 +93,9 @@ class BackgroundLoops:
 
             if self._settings.deletions_enabled:
                 self._sweep_deletions()
+
+            if self._settings.favorites_enabled and self._favorite_syncer is not None:
+                self._safely("favorite sync", self._favorite_syncer.sync_once)
 
         if self._backfill.is_running():
             self._safely("backfill", self._backfill.run_slice)

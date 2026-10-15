@@ -66,6 +66,9 @@ def test_asset_response_fields_we_read(spec):
         "visibility",
         "isOffline",
         "isTrashed",
+        # Starred state, pushed to Google via `set_favorite` -- see
+        # `sync.favorites.FavoriteSyncer`.
+        "isFavorite",
         "tags",
         "exifInfo",
     ):

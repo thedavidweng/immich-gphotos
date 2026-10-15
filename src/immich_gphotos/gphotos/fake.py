@@ -19,6 +19,8 @@ class FakeGooglePhotosClient:
         self.uploads: list[tuple[str, str]] = []
         self.albums: dict[str, list[str]] = {}
         self.trashed: list[str] = []
+        self.favorites: dict[str, bool] = {}
+        self.favorite_calls: list[tuple[str, bool]] = []
         self._next_key = 0
 
     def _key(self) -> str:
@@ -57,3 +59,8 @@ class FakeGooglePhotosClient:
         for checksum in checksums:
             self.trashed.append(checksum)
             self.present.pop(checksum, None)
+
+    def set_favorite(self, media_key: str, is_favorite: bool) -> None:
+        self._check_method_failure("set_favorite")
+        self.favorite_calls.append((media_key, is_favorite))
+        self.favorites[media_key] = is_favorite
