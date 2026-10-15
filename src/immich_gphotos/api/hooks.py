@@ -29,6 +29,7 @@ def asset_from_webhook(payload: dict) -> Asset:
             is_offline=bool(raw.get("isOffline", False)),
             is_trashed=bool(raw.get("deletedAt")),
             tags=tuple(t["name"] for t in raw.get("tags") or [] if "name" in t),
+            is_favorite=bool(raw.get("isFavorite", False)),
         )
     except (KeyError, TypeError, ChecksumError) as exc:
         raise ValueError(f"unusable webhook payload: {exc}") from exc

@@ -255,3 +255,15 @@ class GpmcClient:
     def trash(self, checksums: Sequence[str]) -> None:
         keys = list(checksums)
         self._guard("trash", lambda client: client.move_to_trash(keys))
+
+    def set_favorite(self, media_key: str, is_favorite: bool) -> None:
+        """Star or unstar one item in Google Photos.
+
+        gpmc names the parameter `dedup_key`, but the endpoint accepts the
+        remote `media_key` (the `AF1Qip...` value recorded in the asset table
+        on upload/dedup) -- verified live against Google Photos.
+        """
+        self._guard(
+            "favorite",
+            lambda client: client.api.set_favorite(media_key, is_favorite),
+        )

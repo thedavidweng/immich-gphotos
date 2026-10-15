@@ -48,6 +48,7 @@ class SettingsPatch(BaseModel):
     quality: Quality | None = None
     albums_enabled: bool | None = None
     deletions_enabled: bool | None = None
+    favorites_enabled: bool | None = None
     confirm_deletions: str | None = None
     worker_threads: int | None = Field(default=None, ge=MIN_WORKER_THREADS, le=MAX_WORKER_THREADS)
     bandwidth_bytes_per_second: int | None = Field(default=None, ge=MIN_BANDWIDTH_BYTES_PER_SECOND)
@@ -66,7 +67,7 @@ def resolve_settings_updates(patch: SettingsPatch, *, exclude: set[str]) -> dict
     value is `None`.
 
     Every other field on `SettingsPatch` (`quality`, `albums_enabled`,
-    `deletions_enabled`, `worker_threads`) has no `None` state on `Settings`
+    `deletions_enabled`, `favorites_enabled`, `worker_threads`) has no `None` state on `Settings`
     itself -- `None` there only ever means "leave unchanged" -- so an
     explicit null for any of those is treated the same as omitting it.
     `bandwidth_bytes_per_second` is the only field that is genuinely nullable
@@ -154,7 +155,7 @@ def retry(asset_id: str, request: Request) -> dict:
 def _settings_view(services: Services) -> dict:
     """The one true shape of "settings" as reported to a client: read off the
     live `Settings`, which already carries both the account half (quality,
-    albums_enabled, deletions_enabled) and the global half
+    albums_enabled, deletions_enabled, favorites_enabled) and the global half
     (worker_threads, bandwidth_bytes_per_second) merged together by
     `accounts.build._merged_settings` -- regardless of which of the two
     on-disk rows each field actually lives in. Shared by `get_settings` and
@@ -164,6 +165,7 @@ def _settings_view(services: Services) -> dict:
         "quality": services.settings.quality,
         "albums_enabled": services.settings.albums_enabled,
         "deletions_enabled": services.settings.deletions_enabled,
+        "favorites_enabled": services.settings.favorites_enabled,
         "worker_threads": services.settings.worker_threads,
         "bandwidth_bytes_per_second": services.settings.bandwidth_bytes_per_second,
     }

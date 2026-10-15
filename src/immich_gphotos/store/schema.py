@@ -32,7 +32,13 @@ CREATE TABLE IF NOT EXISTS asset (
   last_error        TEXT,
   ineligible_reason TEXT,
   first_seen_at     TEXT NOT NULL,
-  synced_at         TEXT
+  synced_at         TEXT,
+  -- What Immich currently says about starring (`Asset.is_favorite`), versus
+  -- what has actually been pushed to Google (`favorite_synced`: NULL means
+  -- never pushed, 0/1 the last value sent). The sweeper pushes wherever the
+  -- two disagree -- see `sync.favorites.FavoriteSyncer`.
+  is_favorite       INTEGER NOT NULL DEFAULT 0,
+  favorite_synced   INTEGER
 );
 CREATE INDEX IF NOT EXISTS asset_queue ON asset(state, priority, next_attempt_at);
 CREATE INDEX IF NOT EXISTS asset_checksum ON asset(checksum);
@@ -71,6 +77,8 @@ CREATE TABLE IF NOT EXISTS event (
 COLUMN_MIGRATIONS: tuple[tuple[str, str, str], ...] = (
     ("asset", "bandwidth_deferred_at", "ALTER TABLE asset ADD COLUMN bandwidth_deferred_at TEXT"),
     ("asset", "taken_at", "ALTER TABLE asset ADD COLUMN taken_at TEXT"),
+    ("asset", "is_favorite", "ALTER TABLE asset ADD COLUMN is_favorite INTEGER NOT NULL DEFAULT 0"),
+    ("asset", "favorite_synced", "ALTER TABLE asset ADD COLUMN favorite_synced INTEGER"),
 )
 
 

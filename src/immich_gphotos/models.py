@@ -84,6 +84,10 @@ class Asset:
     # their own. Optional: a webhook payload or an Immich version that omits
     # the field simply leaves the upload undated, as before.
     taken_at: str | None = None
+    # Immich's `isFavorite`: whether the user starred the asset. Carried so
+    # the worker can push it to Google immediately after upload/dedup and the
+    # favorite sweeper can reconcile later drifts -- see `sync.favorites`.
+    is_favorite: bool = False
 
 
 @dataclass(frozen=True)
@@ -100,3 +104,7 @@ class StoredAsset:
     error_class: ErrorClass | None
     last_error: str | None
     ineligible_reason: str | None
+    # The last favorite value pushed to Google (None = never pushed).
+    # Compared against `asset.is_favorite` by the favorite sweeper to find
+    # drift without re-uploading bytes -- see `sync.favorites`.
+    favorite_synced: bool | None = None

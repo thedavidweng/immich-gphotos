@@ -38,6 +38,7 @@ from immich_gphotos.sync.albums import AlbumMirror
 from immich_gphotos.sync.backfill import BackfillJob
 from immich_gphotos.sync.bytes import ByteResolver
 from immich_gphotos.sync.deletions import DeletionSweeper
+from immich_gphotos.sync.favorites import FavoriteSyncer
 from immich_gphotos.sync.loops import BackgroundLoops
 from immich_gphotos.sync.reconciler import Reconciler
 from immich_gphotos.sync.runtime import Runtime
@@ -136,6 +137,7 @@ def build_runtime_graph(
         clock,
         bandwidth=bandwidth,
         gate=gate,
+        favorites_enabled=settings.favorites_enabled,
     )
     runtime = Runtime(assets, worker, settings, clock, events, immich=immich)
     backfill = BackfillJob(immich, assets, cursors, settings)
@@ -149,6 +151,7 @@ def build_runtime_graph(
         clock=clock,
         events=events,
         assets=assets,
+        favorite_syncer=FavoriteSyncer(gphotos, assets),
     )
     return runtime, backfill, loops
 

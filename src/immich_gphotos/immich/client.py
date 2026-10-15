@@ -32,6 +32,7 @@ def _to_asset(item: dict[str, Any]) -> Asset:
         is_offline=bool(item.get("isOffline", False)),
         is_trashed=bool(item.get("isTrashed", False)),
         tags=tuple(t["name"] for t in item.get("tags") or [] if "name" in t),
+        is_favorite=bool(item.get("isFavorite", False)),
     )
 
 

@@ -11,7 +11,7 @@ from typing import Any
 from immich_gphotos.clock import Clock
 from immich_gphotos.config import Filters, RetryPolicy
 from immich_gphotos.gphotos.protocol import GooglePhotosClient, GPhotosError
-from immich_gphotos.models import AssetState, ErrorClass, Outcome, StoredAsset
+from immich_gphotos.models import Asset, AssetState, ErrorClass, Outcome, StoredAsset
 from immich_gphotos.store.assets import AssetRepo
 from immich_gphotos.sync.backoff import next_delay, should_quarantine
 from immich_gphotos.sync.bytes import ByteResolver
@@ -72,6 +72,7 @@ class Worker:
         bandwidth: TokenBucket | None = None,
         gate: AbstractContextManager[Any] | None = None,
         sleep: Callable[[float], None] = time.sleep,
+        favorites_enabled: bool = True,
     ) -> None:
         self._assets = assets
         self._gphotos = gphotos
@@ -95,6 +96,11 @@ class Worker:
         # Injectable so tests can drive the wait with a FakeClock and assert
         # on it without a real sleep; production uses the real time.sleep.
         self._sleep = sleep
+        # Whether a favorited asset is starred in Google immediately after its
+        # bytes land (or dedup clears it). Off means the worker never calls
+        # set_favorite and every drift waits for the sweeper -- which itself
+        # is gated on the same flag in `BackgroundLoops`, so off is fully off.
+        self._favorites_enabled = favorites_enabled
         # Ids for which a previous call already charged the bucket (via
         # `TokenBucket.take`) but deferred rather than sleeping out the
         # result -- see `_throttle_upload`. When such an asset is reclaimed,
@@ -159,12 +165,14 @@ class Worker:
             local_key = self._assets.media_key_for_checksum(asset.checksum)
             if local_key:
                 self._assets.mark_synced(asset.immich_id, local_key, Outcome.ALREADY_PRESENT)
+                self._star_if_favorited(asset, local_key)
                 return WorkerResult(AssetState.SYNCED, Outcome.ALREADY_PRESENT, local_key)
 
             try:
                 remote_key = self._gphotos.exists(asset.checksum)
                 if remote_key:
                     self._assets.mark_synced(asset.immich_id, remote_key, Outcome.ALREADY_PRESENT)
+                    self._star_if_favorited(asset, remote_key)
                     return WorkerResult(AssetState.SYNCED, Outcome.ALREADY_PRESENT, remote_key)
 
                 if not transfer_allowed:
@@ -253,6 +261,7 @@ class Worker:
                     self._resolver.release(resolved)
 
                 self._assets.mark_synced(asset.immich_id, media_key, Outcome.UPLOADED)
+                self._star_if_favorited(asset, media_key)
                 return WorkerResult(AssetState.SYNCED, Outcome.UPLOADED, media_key)
 
             except GPhotosError as exc:
@@ -270,6 +279,30 @@ class Worker:
             if not retain_prepaid and self._bandwidth is not None:
                 with self._throttle_prepaid_lock:
                     self._throttle_prepaid.discard(asset.immich_id)
+
+    def _star_if_favorited(self, asset: Asset, media_key: str) -> None:
+        """Star a newly-synced asset in Google when Immich has it starred.
+
+        Best-effort by design: the bytes are already safe (mark_synced ran),
+        so a star that fails -- or a database write that fails -- leaves the
+        row drifted and the sweeper retries it next tick. Never raises, never
+        halts transfer, never burns an upload attempt. Only True is pushed
+        here; un-starring (and any True that failed here) is the sweeper's
+        job, which is also what covers stars added after the bytes synced.
+
+        Disabled entirely when `favorites_enabled` is off.
+        """
+        if not self._favorites_enabled or not asset.is_favorite:
+            return
+        try:
+            self._gphotos.set_favorite(media_key, True)
+        except Exception as exc:  # noqa: BLE001 - a star is never worth failing a backup over
+            logger.debug("could not star %s in Google Photos: %s", asset.immich_id, exc)
+            return
+        try:
+            self._assets.mark_favorite_synced(asset.immich_id, True)
+        except Exception as exc:  # noqa: BLE001 - the next sweep will simply retry
+            logger.debug("could not record favorite for %s: %s", asset.immich_id, exc)
 
     def _throttle_upload(self, immich_id: str, path: Path) -> float | None:
         """Make the caller wait its share of the configured upload bandwidth cap,
