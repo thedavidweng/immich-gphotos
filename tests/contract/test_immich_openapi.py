@@ -66,6 +66,9 @@ def test_asset_response_fields_we_read(spec):
         "visibility",
         "isOffline",
         "isTrashed",
+        # Apple Live Photo companion id, muxed into a Motion Photo before
+        # upload -- see `sync.livephoto`.
+        "livePhotoVideoId",
         "tags",
         "exifInfo",
     ):

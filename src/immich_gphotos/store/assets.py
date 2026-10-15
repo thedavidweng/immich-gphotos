@@ -25,6 +25,7 @@ def _row_to_stored(row: sqlite3.Row) -> StoredAsset:
         size_bytes=row["size_bytes"],
         immich_updated_at=row["immich_updated_at"],
         taken_at=row["taken_at"],
+        live_photo_video_id=row["live_photo_video_id"],
         original_path=row["original_path"],
         visibility=row["visibility"],
         is_offline=bool(row["is_offline"]),
@@ -78,9 +79,10 @@ class AssetRepo:
         with self._conn.lock:
             row = self._conn.execute(
                 "INSERT INTO asset (immich_id, checksum, filename, type, size_bytes,"
-                " immich_updated_at, taken_at, original_path, visibility, is_offline, is_trashed,"
+                " immich_updated_at, taken_at, live_photo_video_id, original_path, visibility,"
+                " is_offline, is_trashed,"
                 " tags, state, priority, first_seen_at)"
-                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
                 " ON CONFLICT(immich_id) DO UPDATE SET"
                 "  state = CASE"
                 "    WHEN state = ? AND ineligible_reason = ? THEN ?"
@@ -97,6 +99,7 @@ class AssetRepo:
                 "  END,"
                 "  is_trashed = excluded.is_trashed,"
                 "  taken_at = excluded.taken_at,"
+                "  live_photo_video_id = excluded.live_photo_video_id,"
                 "  visibility = excluded.visibility,"
                 "  immich_updated_at = excluded.immich_updated_at,"
                 "  is_offline = excluded.is_offline,"
@@ -110,6 +113,7 @@ class AssetRepo:
                     asset.size_bytes,
                     asset.immich_updated_at,
                     asset.taken_at,
+                    asset.live_photo_video_id,
                     asset.original_path,
                     asset.visibility,
                     int(asset.is_offline),

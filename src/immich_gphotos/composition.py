@@ -126,7 +126,7 @@ def build_runtime_graph(
     "no cap" / "no gate", exactly as before, and costs nothing extra --
     `Worker` never touches an unset bandwidth or gate.
     """
-    resolver = ByteResolver(immich, scratch=scratch, allow_direct=allow_direct)
+    resolver = ByteResolver(immich, scratch=scratch, allow_direct=allow_direct, assets=assets)
     worker = Worker(
         assets,
         gphotos,

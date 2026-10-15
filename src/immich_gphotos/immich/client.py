@@ -27,6 +27,7 @@ def _to_asset(item: dict[str, Any]) -> Asset:
         size_bytes=exif.get("fileSizeInByte"),
         immich_updated_at=item.get("updatedAt", ""),
         taken_at=item.get("fileCreatedAt"),
+        live_photo_video_id=item.get("livePhotoVideoId"),
         original_path=item.get("originalPath"),
         visibility=item.get("visibility", "timeline"),
         is_offline=bool(item.get("isOffline", False)),

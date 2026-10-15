@@ -32,7 +32,11 @@ CREATE TABLE IF NOT EXISTS asset (
   last_error        TEXT,
   ineligible_reason TEXT,
   first_seen_at     TEXT NOT NULL,
-  synced_at         TEXT
+  synced_at         TEXT,
+  -- For an Apple Live Photo still, the Immich id of the companion `.MOV`
+  -- (`Asset.live_photo_video_id`). The still and its motion are muxed into
+  -- one Google Motion Photo before upload -- see `sync.livephoto`.
+  live_photo_video_id TEXT
 );
 CREATE INDEX IF NOT EXISTS asset_queue ON asset(state, priority, next_attempt_at);
 CREATE INDEX IF NOT EXISTS asset_checksum ON asset(checksum);
@@ -71,6 +75,7 @@ CREATE TABLE IF NOT EXISTS event (
 COLUMN_MIGRATIONS: tuple[tuple[str, str, str], ...] = (
     ("asset", "bandwidth_deferred_at", "ALTER TABLE asset ADD COLUMN bandwidth_deferred_at TEXT"),
     ("asset", "taken_at", "ALTER TABLE asset ADD COLUMN taken_at TEXT"),
+    ("asset", "live_photo_video_id", "ALTER TABLE asset ADD COLUMN live_photo_video_id TEXT"),
 )
 
 

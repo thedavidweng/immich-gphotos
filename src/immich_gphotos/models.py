@@ -84,6 +84,11 @@ class Asset:
     # their own. Optional: a webhook payload or an Immich version that omits
     # the field simply leaves the upload undated, as before.
     taken_at: str | None = None
+    # Immich's `livePhotoVideoId`: for an Apple Live Photo still, the id of
+    # the companion `.MOV` asset (which Immich stores hidden). Carried so the
+    # still and its motion can be muxed into one Google Motion Photo before
+    # upload -- see `sync.livephoto`. None for everything else.
+    live_photo_video_id: str | None = None
 
 
 @dataclass(frozen=True)
