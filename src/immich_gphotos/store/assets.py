@@ -351,17 +351,25 @@ class AssetRepo:
             )
 
     def favorite_drift(self, limit: int = 500) -> list[StoredAsset]:
-        """SYNCED rows whose star no longer matches what Google was told.
+        """SYNCED rows whose star Google does not know about yet.
 
-        `favorite_synced IS NULL` covers both never-pushed rows and databases
-        from before the column existed; `!= is_favorite` covers a star added
-        or removed in Immich after the last push. Only rows with a `media_key`
-        can be pushed -- without one there is nothing in Google to star.
+        Only two shapes need a push: starred in Immich but never told to
+        Google (`is_favorite = 1` with nothing recorded), or told before
+        but changed in Immich since (`favorite_synced` disagrees). A row
+        that was never starred and never pushed needs nothing: Google's
+        default is unstarred, so pushing `False` for it would be a no-op
+        API call -- and across a whole historical library, tens of
+        thousands of them, enough to trip rate limiting for zero benefit.
+        Only rows with a `media_key` can be pushed -- without one there is
+        nothing in Google to star.
         """
         with self._conn.lock:
             rows = self._conn.execute(
                 "SELECT * FROM asset WHERE state = ? AND media_key IS NOT NULL"
-                " AND (favorite_synced IS NULL OR favorite_synced != is_favorite)"
+                " AND ("
+                "   (is_favorite = 1 AND favorite_synced IS NULL)"
+                "   OR (favorite_synced IS NOT NULL AND favorite_synced != is_favorite)"
+                " )"
                 " ORDER BY first_seen_at ASC LIMIT ?",
                 (AssetState.SYNCED.value, limit),
             ).fetchall()

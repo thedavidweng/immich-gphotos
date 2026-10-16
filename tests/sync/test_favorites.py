@@ -129,6 +129,29 @@ def test_sweeper_skips_rows_with_no_media_key_and_up_to_date_rows(tmp_path):
     assert gphotos.favorite_calls == []
 
 
+def test_never_starred_never_pushed_rows_are_not_drift(tmp_path):
+    """Regression: after the favorites upgrade, every historical SYNCED row
+    carries `favorite_synced IS NULL` -- but 99% were never starred, and
+    Google's default is unstarred, so pushing `False` for all of them would
+    be tens of thousands of no-op API calls (and a rate-limit incident).
+    Only starred-but-never-pushed rows count as drift."""
+    clock = FakeClock()
+    assets = AssetRepo(connect(tmp_path / "t.db"), clock)
+    gphotos = FakeGooglePhotosClient()
+    syncer = FavoriteSyncer(gphotos, assets)
+
+    for i in range(5):
+        _sync(assets, replace(ASSET, immich_id=f"plain-{i}", checksum=f"p{i}", is_favorite=False), f"k{i}")
+    _sync(assets, replace(ASSET, immich_id="starred", checksum="s", is_favorite=True), "ks")
+
+    assert [d.asset.immich_id for d in assets.favorite_drift()] == ["starred"]
+    result = syncer.sync_once()
+
+    assert result.synced == 1
+    assert gphotos.favorite_calls == [("ks", True)]
+    assert assets.get("plain-0").favorite_synced is None
+
+
 def test_sweeper_continues_past_a_single_failure(tmp_path):
     clock = FakeClock()
     assets = AssetRepo(connect(tmp_path / "t.db"), clock)
