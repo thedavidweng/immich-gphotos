@@ -182,10 +182,10 @@ class ByteResolver:
         """Mux a Live Photo still with its companion motion, or None.
 
         None means "upload the still alone": the companion row is missing,
-        either side's bytes cannot be read, the still is not a JPEG (HEIC
-        Motion Photos need an `mpvd` box plus `Padding`, a separate project),
-        or the video is empty/oversized/unrecognised. Every such case logs
-        at debug and falls back -- never raises out of `resolve`.
+        either side's bytes cannot be read, the still is neither a JPEG nor
+        a parsable HEIC/AVIF still, or the video is empty/oversized/
+        unrecognised. Every such case logs at debug and falls back -- never
+        raises out of `resolve`.
         """
         from immich_gphotos.sync import livephoto
 
@@ -216,12 +216,20 @@ class ByteResolver:
             except OSError as exc:
                 logger.debug("could not read Live Photo pair for %s: %s", still.immich_id, exc)
                 return None
+            video_mime = livephoto.video_mime_for_filename(companion.filename)
             try:
-                muxed = livephoto.build_motion_photo_jpeg(
-                    still_bytes,
-                    video_bytes,
-                    livephoto.video_mime_for_filename(companion.filename),
-                )
+                if livephoto.is_jpeg(still_bytes):
+                    muxed = livephoto.build_motion_photo_jpeg(still_bytes, video_bytes, video_mime)
+                elif (kind := livephoto.isobmff_image_kind(still_bytes)) is not None:
+                    muxed = livephoto.build_motion_photo_isobmff(
+                        still_bytes,
+                        video_bytes,
+                        livephoto.image_mime_for_kind(kind),
+                        video_mime,
+                    )
+                else:
+                    logger.debug("not muxing Live Photo %s: still is not JPEG/HEIC/AVIF", still.immich_id)
+                    return None
             except ValueError as exc:
                 logger.debug("not muxing Live Photo %s: %s", still.immich_id, exc)
                 return None
