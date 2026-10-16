@@ -38,7 +38,11 @@ CREATE TABLE IF NOT EXISTS asset (
   -- never pushed, 0/1 the last value sent). The sweeper pushes wherever the
   -- two disagree -- see `sync.favorites.FavoriteSyncer`.
   is_favorite       INTEGER NOT NULL DEFAULT 0,
-  favorite_synced   INTEGER
+  favorite_synced   INTEGER,
+  -- For an Apple Live Photo still, the Immich id of the companion `.MOV`
+  -- (`Asset.live_photo_video_id`). The still and its motion are muxed into
+  -- one Google Motion Photo before upload -- see `sync.livephoto`.
+  live_photo_video_id TEXT
 );
 CREATE INDEX IF NOT EXISTS asset_queue ON asset(state, priority, next_attempt_at);
 CREATE INDEX IF NOT EXISTS asset_checksum ON asset(checksum);
@@ -79,6 +83,7 @@ COLUMN_MIGRATIONS: tuple[tuple[str, str, str], ...] = (
     ("asset", "taken_at", "ALTER TABLE asset ADD COLUMN taken_at TEXT"),
     ("asset", "is_favorite", "ALTER TABLE asset ADD COLUMN is_favorite INTEGER NOT NULL DEFAULT 0"),
     ("asset", "favorite_synced", "ALTER TABLE asset ADD COLUMN favorite_synced INTEGER"),
+    ("asset", "live_photo_video_id", "ALTER TABLE asset ADD COLUMN live_photo_video_id TEXT"),
 )
 
 

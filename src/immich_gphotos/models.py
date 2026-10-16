@@ -88,6 +88,11 @@ class Asset:
     # the worker can push it to Google immediately after upload/dedup and the
     # favorite sweeper can reconcile later drifts -- see `sync.favorites`.
     is_favorite: bool = False
+    # Immich's `livePhotoVideoId`: for an Apple Live Photo still, the id of
+    # the companion `.MOV` asset (which Immich stores hidden). Carried so the
+    # still and its motion can be muxed into one Google Motion Photo before
+    # upload -- see `sync.livephoto`. None for everything else.
+    live_photo_video_id: str | None = None
 
 
 @dataclass(frozen=True)

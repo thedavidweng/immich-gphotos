@@ -69,6 +69,9 @@ def test_asset_response_fields_we_read(spec):
         # Starred state, pushed to Google via `set_favorite` -- see
         # `sync.favorites.FavoriteSyncer`.
         "isFavorite",
+        # Apple Live Photo companion id, muxed into a Motion Photo before
+        # upload -- see `sync.livephoto`.
+        "livePhotoVideoId",
         "tags",
         "exifInfo",
     ):

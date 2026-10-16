@@ -1,3 +1,5 @@
+import base64
+import hashlib
 import logging
 import threading
 import time
@@ -16,6 +18,7 @@ from immich_gphotos.store.assets import AssetRepo
 from immich_gphotos.sync.backoff import next_delay, should_quarantine
 from immich_gphotos.sync.bytes import ByteResolver
 from immich_gphotos.sync.eligibility import check_eligibility
+from immich_gphotos.sync.livephoto import LIVE_PHOTO_PAIRED_REASON
 from immich_gphotos.sync.throttle import TokenBucket
 
 HALT_RETRY_DELAY = timedelta(minutes=10)
@@ -44,6 +47,24 @@ WINDOW_RETRY_DELAY = timedelta(minutes=15)
 MAX_INLINE_THROTTLE_WAIT_SECONDS = 30.0
 
 logger = logging.getLogger(__name__)
+
+
+def _sha1_base64_of_file(path: Path) -> str | None:
+    """Base64 SHA-1 of the file at `path`, or None when it cannot be read.
+
+    Chunked so a tens-of-megabytes muxed Motion Photo never sits in memory
+    twice. Only used for the muxed-upload hash -- ordinary uploads reuse the
+    precomputed Immich checksum without touching the bytes.
+    """
+    digest = hashlib.sha1()
+    try:
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+    except OSError as exc:
+        logger.debug("could not hash %s: %s", path.name, exc)
+        return None
+    return base64.b64encode(digest.digest()).decode("ascii")
 
 
 @dataclass(frozen=True)
@@ -201,6 +222,34 @@ class Worker:
 
                 resolved = self._resolver.resolve(asset)
                 try:
+                    upload_checksum = asset.checksum
+                    if resolved.paired_video_id is not None:
+                        # A muxed Motion Photo's bytes differ from the still's,
+                        # so the still's hash would misdescribe them to Google.
+                        # Describe the bytes actually going up; the still's own
+                        # hash already had its say in both dedup checks above.
+                        muxed_checksum = _sha1_base64_of_file(resolved.path)
+                        if muxed_checksum is None:
+                            # Could not hash (file vanished mid-upload?) --
+                            # fall back to the still's hash rather than failing
+                            # the backup over bookkeeping.
+                            pass
+                        else:
+                            upload_checksum = muxed_checksum
+                            try:
+                                muxed_remote = self._gphotos.exists(muxed_checksum)
+                            except GPhotosError:
+                                raise
+                            except Exception as exc:  # noqa: BLE001 - a dedup miss just uploads
+                                logger.debug("muxed hash lookup failed for %s: %s", asset.immich_id, exc)
+                                muxed_remote = None
+                            if muxed_remote:
+                                self._assets.mark_synced(
+                                    asset.immich_id, muxed_remote, Outcome.ALREADY_PRESENT
+                                )
+                                self._mark_paired(resolved.paired_video_id)
+                                self._star_if_favorited(asset, muxed_remote)
+                                return WorkerResult(AssetState.SYNCED, Outcome.ALREADY_PRESENT, muxed_remote)
                     defer_wait = self._throttle_upload(asset.immich_id, resolved.path)
                     if defer_wait is not None:
                         # The bandwidth cap would otherwise block this thread
@@ -251,17 +300,19 @@ class Worker:
                     if self._gate is not None:
                         with self._gate:
                             media_key = self._gphotos.upload(
-                                resolved.path, checksum=asset.checksum, filename=asset.filename
+                                resolved.path, checksum=upload_checksum, filename=asset.filename
                             )
                     else:
                         media_key = self._gphotos.upload(
-                            resolved.path, checksum=asset.checksum, filename=asset.filename
+                            resolved.path, checksum=upload_checksum, filename=asset.filename
                         )
                 finally:
                     self._resolver.release(resolved)
 
                 self._assets.mark_synced(asset.immich_id, media_key, Outcome.UPLOADED)
                 self._star_if_favorited(asset, media_key)
+                if resolved.paired_video_id is not None:
+                    self._mark_paired(resolved.paired_video_id)
                 return WorkerResult(AssetState.SYNCED, Outcome.UPLOADED, media_key)
 
             except GPhotosError as exc:
@@ -303,6 +354,20 @@ class Worker:
             self._assets.mark_favorite_synced(asset.immich_id, True)
         except Exception as exc:  # noqa: BLE001 - the next sweep will simply retry
             logger.debug("could not record favorite for %s: %s", asset.immich_id, exc)
+
+    def _mark_paired(self, companion_id: str) -> None:
+        """Account for a companion `.MOV` folded into its still's upload.
+
+        Best-effort: the still is already SYNCED, so a bookkeeping write
+        that fails just leaves the companion `hidden` for now rather than
+        failing anything. Overwrites whatever reason the companion carried
+        (`hidden` when the worker saw it first, or still PENDING when the
+        still won the race) -- both are terminal-or-harmless from here.
+        """
+        try:
+            self._assets.mark_ineligible(companion_id, LIVE_PHOTO_PAIRED_REASON)
+        except Exception as exc:  # noqa: BLE001 - bookkeeping, never worth failing over
+            logger.debug("could not mark Live Photo motion %s paired: %s", companion_id, exc)
 
     def _throttle_upload(self, immich_id: str, path: Path) -> float | None:
         """Make the caller wait its share of the configured upload bandwidth cap,
