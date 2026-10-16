@@ -2,6 +2,7 @@
 
 import base64
 import hashlib
+import struct
 from dataclasses import replace
 
 from immich_gphotos.clock import FakeClock
@@ -47,6 +48,44 @@ MOV = Asset(
     is_offline=False,
     is_trashed=False,
 )
+
+
+def _minimal_heic_still() -> bytes:
+    """One hvc1 item + v1 iloc: just enough structure to exercise the mux path."""
+
+    def box(t: bytes, p: bytes) -> bytes:
+        return struct.pack(">I", 8 + len(p)) + t + p
+
+    image = bytes(range(32))
+    ftyp = box(b"ftyp", b"heic" + struct.pack(">I", 0) + b"heic")
+    hdlr = box(b"hdlr", b"\x00" * 8 + b"pict" + b"\x00" * 12 + b"\x00")
+    pitm = box(b"pitm", b"\x00\x00\x00\x00" + struct.pack(">H", 1))
+    infe = struct.pack(">H", 1) + struct.pack(">H", 0) + b"hvc1" + b"Image\x00" + b"\x00"
+    iinf = box(b"iinf", b"\x02\x00\x00\x00" + struct.pack(">I", 1) + infe)
+
+    def iloc_with(offset: int) -> bytes:
+        return box(
+            b"iloc",
+            b"\x01\x00\x00\x00"
+            + bytes([(4 << 4) | 4])
+            + bytes([(4 << 4) | 0])
+            + struct.pack(">H", 1)
+            + struct.pack(">H", 1)
+            + struct.pack(">H", 0)
+            + struct.pack(">H", 0)
+            + struct.pack(">I", 0)
+            + struct.pack(">H", 1)
+            + struct.pack(">I", offset)
+            + struct.pack(">I", len(image)),
+        )
+
+    # iloc length is offset-invariant: measure with a dummy, then rebuild.
+    meta_len = 8 + 4 + len(hdlr) + len(pitm) + len(iinf) + len(iloc_with(0))
+    img_off = len(ftyp) + meta_len + 8
+    iloc = iloc_with(img_off)
+    meta = box(b"meta", b"\x00\x00\x00\x00" + hdlr + pitm + iinf + iloc)
+    assert len(meta) == meta_len
+    return ftyp + meta + box(b"mdat", image)
 
 
 def _muxed_hash() -> str:
@@ -134,6 +173,31 @@ def test_heic_still_falls_back_without_pairing(tmp_path):
     assert result.state is AssetState.SYNCED
     assert gphotos.uploads == [("sum-still", "IMG_1.JPG")]
     assert assets.get("mov-1").ineligible_reason != LIVE_PHOTO_PAIRED_REASON
+
+
+def test_heic_pair_is_muxed_with_mpvd_and_paired_on_upload(tmp_path):
+    from immich_gphotos.sync.livephoto import build_motion_photo_isobmff
+
+    heic_bytes = _minimal_heic_still()
+    expected_muxed = build_motion_photo_isobmff(heic_bytes, VIDEO_BYTES, "image/heic", "video/quicktime")
+    expected_hash = base64.b64encode(hashlib.sha1(expected_muxed).digest()).decode()
+
+    heic_still = replace(STILL, immich_id="still-1", filename="IMG_1.HEIC", live_photo_video_id="mov-1")
+    clock = FakeClock()
+    assets = AssetRepo(connect(tmp_path / "t.db"), clock)
+    immich = FakeImmichClient(contents={"still-1": heic_bytes, "mov-1": VIDEO_BYTES})
+    gphotos = FakeGooglePhotosClient()
+    resolver = ByteResolver(immich, scratch=tmp_path / "scratch", assets=assets)
+    worker = Worker(assets, gphotos, resolver, Filters(), RetryPolicy(jitter=0.0), clock)
+    assets.upsert_pending(heic_still, Priority.WEBHOOK)
+    assets.upsert_pending(MOV, Priority.WEBHOOK)
+
+    result = worker.process(assets.claim_next(limit=1)[0])
+
+    assert result.state is AssetState.SYNCED
+    assert result.outcome is Outcome.UPLOADED
+    assert gphotos.uploads == [(expected_hash, "IMG_1.HEIC")]
+    assert assets.get("mov-1").ineligible_reason == LIVE_PHOTO_PAIRED_REASON
 
 
 def test_muxed_remote_hit_marks_synced_without_uploading(tmp_path):
