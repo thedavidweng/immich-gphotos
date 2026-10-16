@@ -38,6 +38,7 @@ from immich_gphotos.sync.albums import AlbumMirror
 from immich_gphotos.sync.backfill import BackfillJob
 from immich_gphotos.sync.bytes import ByteResolver
 from immich_gphotos.sync.deletions import DeletionSweeper
+from immich_gphotos.sync.exif_xmp import ExifToolMotionPhotoXmp
 from immich_gphotos.sync.favorites import FavoriteSyncer
 from immich_gphotos.sync.loops import BackgroundLoops
 from immich_gphotos.sync.reconciler import Reconciler
@@ -127,7 +128,13 @@ def build_runtime_graph(
     "no cap" / "no gate", exactly as before, and costs nothing extra --
     `Worker` never touches an unset bandwidth or gate.
     """
-    resolver = ByteResolver(immich, scratch=scratch, allow_direct=allow_direct, assets=assets)
+    resolver = ByteResolver(
+        immich,
+        scratch=scratch,
+        allow_direct=allow_direct,
+        assets=assets,
+        xmp=ExifToolMotionPhotoXmp.if_available(),
+    )
     worker = Worker(
         assets,
         gphotos,

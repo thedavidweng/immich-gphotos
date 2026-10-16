@@ -2,8 +2,8 @@
 
 import base64
 import hashlib
-import struct
 from dataclasses import replace
+from pathlib import Path
 
 from immich_gphotos.clock import FakeClock
 from immich_gphotos.config import Filters, RetryPolicy
@@ -51,41 +51,13 @@ MOV = Asset(
 
 
 def _minimal_heic_still() -> bytes:
-    """One hvc1 item + v1 iloc: just enough structure to exercise the mux path."""
+    """A tiny but real HEIC still for the ExifTool path (checked-in fixture).
 
-    def box(t: bytes, p: bytes) -> bytes:
-        return struct.pack(">I", 8 + len(p)) + t + p
-
-    image = bytes(range(32))
-    ftyp = box(b"ftyp", b"heic" + struct.pack(">I", 0) + b"heic")
-    hdlr = box(b"hdlr", b"\x00" * 8 + b"pict" + b"\x00" * 12 + b"\x00")
-    pitm = box(b"pitm", b"\x00\x00\x00\x00" + struct.pack(">H", 1))
-    infe = struct.pack(">H", 1) + struct.pack(">H", 0) + b"hvc1" + b"Image\x00" + b"\x00"
-    iinf = box(b"iinf", b"\x02\x00\x00\x00" + struct.pack(">I", 1) + infe)
-
-    def iloc_with(offset: int) -> bytes:
-        return box(
-            b"iloc",
-            b"\x01\x00\x00\x00"
-            + bytes([(4 << 4) | 4])
-            + bytes([(4 << 4) | 0])
-            + struct.pack(">H", 1)
-            + struct.pack(">H", 1)
-            + struct.pack(">H", 0)
-            + struct.pack(">H", 0)
-            + struct.pack(">I", 0)
-            + struct.pack(">H", 1)
-            + struct.pack(">I", offset)
-            + struct.pack(">I", len(image)),
-        )
-
-    # iloc length is offset-invariant: measure with a dummy, then rebuild.
-    meta_len = 8 + 4 + len(hdlr) + len(pitm) + len(iinf) + len(iloc_with(0))
-    img_off = len(ftyp) + meta_len + 8
-    iloc = iloc_with(img_off)
-    meta = box(b"meta", b"\x00\x00\x00\x00" + hdlr + pitm + iinf + iloc)
-    assert len(meta) == meta_len
-    return ftyp + meta + box(b"mdat", image)
+    Generated once with pillow-heif (red square); ExifTool accepts it for
+    XMP writes, unlike hand-assembled boxes, so the live test below proves
+    the real integration instead of a toy format.
+    """
+    return (Path(__file__).with_name("fixtures") / "small.heic").read_bytes()
 
 
 def _muxed_hash() -> str:
@@ -175,19 +147,23 @@ def test_heic_still_falls_back_without_pairing(tmp_path):
     assert assets.get("mov-1").ineligible_reason != LIVE_PHOTO_PAIRED_REASON
 
 
-def test_heic_pair_is_muxed_with_mpvd_and_paired_on_upload(tmp_path):
-    from immich_gphotos.sync.livephoto import build_motion_photo_isobmff
+def test_heic_pair_is_muxed_via_exiftool_and_paired_on_upload(tmp_path):
+    from immich_gphotos.sync import livephoto
+    from immich_gphotos.sync.exif_xmp import FakeMotionPhotoXmp
 
     heic_bytes = _minimal_heic_still()
-    expected_muxed = build_motion_photo_isobmff(heic_bytes, VIDEO_BYTES, "image/heic", "video/quicktime")
-    expected_hash = base64.b64encode(hashlib.sha1(expected_muxed).digest()).decode()
+    fake = FakeMotionPhotoXmp(keyframe_us=1500000)
+    # The fake leaves the staged copy byte-identical (the real writer would
+    # embed the packet); the trailer append is real code either way.
+    expected = heic_bytes + livephoto.heic_trailer(VIDEO_BYTES, len(heic_bytes))
+    expected_hash = base64.b64encode(hashlib.sha1(expected).digest()).decode()
 
     heic_still = replace(STILL, immich_id="still-1", filename="IMG_1.HEIC", live_photo_video_id="mov-1")
     clock = FakeClock()
     assets = AssetRepo(connect(tmp_path / "t.db"), clock)
     immich = FakeImmichClient(contents={"still-1": heic_bytes, "mov-1": VIDEO_BYTES})
     gphotos = FakeGooglePhotosClient()
-    resolver = ByteResolver(immich, scratch=tmp_path / "scratch", assets=assets)
+    resolver = ByteResolver(immich, scratch=tmp_path / "scratch", assets=assets, xmp=fake)
     worker = Worker(assets, gphotos, resolver, Filters(), RetryPolicy(jitter=0.0), clock)
     assets.upsert_pending(heic_still, Priority.WEBHOOK)
     assets.upsert_pending(MOV, Priority.WEBHOOK)
@@ -198,6 +174,40 @@ def test_heic_pair_is_muxed_with_mpvd_and_paired_on_upload(tmp_path):
     assert result.outcome is Outcome.UPLOADED
     assert gphotos.uploads == [(expected_hash, "IMG_1.HEIC")]
     assert assets.get("mov-1").ineligible_reason == LIVE_PHOTO_PAIRED_REASON
+    # The packet ExifTool was asked to write names the motion bytes and the
+    # migrated keyframe.
+    assert len(fake.writes) == 1
+    packet = fake.writes[0][1].decode()
+    assert 'Camera:MotionPhotoPresentationTimestampUs="1500000"' in packet
+    assert f'Item:Length="{len(expected) - len(heic_bytes) - 8}"' in packet
+
+
+def test_heic_falls_back_when_exiftool_is_missing_or_refuses(tmp_path):
+    from immich_gphotos.sync.exif_xmp import FakeMotionPhotoXmp
+
+    heic_bytes = _minimal_heic_still()
+
+    class Refusing(FakeMotionPhotoXmp):
+        def write_xmp(self, image, packet):
+            raise RuntimeError("exiftool refused")
+
+    for index, xmp in enumerate((None, Refusing())):
+        clock = FakeClock()
+        assets = AssetRepo(connect(tmp_path / f"t{index}.db"), clock)
+        immich = FakeImmichClient(contents={"still-1": heic_bytes, "mov-1": VIDEO_BYTES})
+        gphotos = FakeGooglePhotosClient()
+        resolver = ByteResolver(immich, scratch=tmp_path / "scratch", assets=assets, xmp=xmp)
+        worker = Worker(assets, gphotos, resolver, Filters(), RetryPolicy(jitter=0.0), clock)
+        assets.upsert_pending(
+            replace(STILL, filename="IMG_1.HEIC", live_photo_video_id="mov-1"), Priority.WEBHOOK
+        )
+        assets.upsert_pending(MOV, Priority.WEBHOOK)
+
+        result = worker.process(assets.claim_next(limit=1)[0])
+
+        assert result.state is AssetState.SYNCED
+        assert gphotos.uploads == [("sum-still", "IMG_1.HEIC")]
+        assert assets.get("mov-1").ineligible_reason != LIVE_PHOTO_PAIRED_REASON
 
 
 def test_muxed_remote_hit_marks_synced_without_uploading(tmp_path):
