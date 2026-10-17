@@ -1,8 +1,10 @@
+import base64
+import hashlib
 import logging
 import os
 import shutil
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 
@@ -58,6 +60,24 @@ def _stamp_capture_date(path: Path, taken_at: str | None) -> None:
         logger.debug("could not stamp capture date %r onto %s: %s", taken_at, path.name, exc)
 
 
+def _sha1_base64_of_file(path: Path) -> str:
+    """Base64 SHA-1 of the file at `path`. Raises OSError when unreadable.
+
+    Chunked so a multi-gigabyte video never sits in memory twice. Google
+    identifies media by the content SHA-1 of the bytes (dedup lookup,
+    X-Goog-Hash, trash-by-dedup-key all derive from it), and Immich's own
+    checksum is that hash only for internal uploads -- External Library rows
+    carry a virtual sha1(path) checksum that never matches either -- so the
+    resolved bytes are always hashed here and the worker describes *these*
+    bytes to Google, never Immich's checksum.
+    """
+    digest = hashlib.sha1()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return base64.b64encode(digest.digest()).decode("ascii")
+
+
 @dataclass(frozen=True)
 class ResolvedBytes:
     path: Path
@@ -68,6 +88,11 @@ class ResolvedBytes:
     # hidden clip is accounted for instead of lingering as `hidden`. None
     # for every ordinary (unmuxed) resolution.
     paired_video_id: str | None = None
+    # Base64 SHA-1 of the bytes at `path` -- always set by `resolve()` (the
+    # helper constructors leave it out and `resolve()` fills it in once).
+    # This is the value google-side consumers must be given; see
+    # `_sha1_base64_of_file` for why Immich's checksum step is never used.
+    sha1_b64: str | None = None
 
 
 class ByteResolver:
@@ -111,22 +136,6 @@ class ByteResolver:
         self._assets = assets
         self._xmp = xmp
 
-    def _scratch_path(self, asset: Asset) -> Path:
-        """A fresh scratch path for one resolution.
-
-        The nonce guarantees a fresh path per call: two concurrent
-        resolutions of the *same* asset (e.g. a slow-but-healthy upload that
-        crosses requeue_stale_uploading's liveness-free age threshold and gets
-        handed to a second worker) must never share a scratch file, or one
-        caller's release() could delete bytes the other is still writing or
-        uploading. Only the basename of the filename is used because
-        `originalFileName` arrives unsanitized from Immich, and a separator
-        in it must not turn into a subdirectory.
-        """
-        self._scratch.mkdir(parents=True, exist_ok=True)
-        nonce = uuid.uuid4().hex
-        return self._scratch / f"{asset.immich_id}-{nonce}-{Path(asset.filename).name}"
-
     def _direct_or_copy(self, candidate: Path, asset: Asset, taken_at: str | None) -> ResolvedBytes:
         """Hand back `candidate` itself when its mtime already agrees with the
         capture date, else a stamped scratch copy of it.
@@ -162,11 +171,23 @@ class ByteResolver:
         return ResolvedBytes(path=dest, temporary=True)
 
     def resolve(self, asset: Asset) -> ResolvedBytes:
+        """Resolve `asset`'s bytes and certify their content SHA-1.
+
+        The muxed Live Photo branch wins when it can mux; otherwise the
+        single-asset path runs. Either way, the returned `ResolvedBytes`
+        carries the SHA-1 of the exact bytes at `path` -- Google keys dedup
+        lookup, upload integrity and trash on the *content* hash, and only
+        Internal-upload Immich checksums ever equal that (External Library
+        rows are sha1(path)), so the worker describes these bytes, never
+        Immich's checksum. An unreadable file raises OSError: unhashed bytes
+        go nowhere rather than up with a description we could not verify.
+        """
+        resolved: ResolvedBytes | None = None
         if asset.live_photo_video_id and self._assets is not None:
-            muxed = self._try_resolve_live_photo(asset)
-            if muxed is not None:
-                return muxed
-        return self._resolve_single(asset)
+            resolved = self._try_resolve_live_photo(asset)
+        if resolved is None:
+            resolved = self._resolve_single(asset)
+        return replace(resolved, sha1_b64=_sha1_base64_of_file(resolved.path))
 
     def _scratch_path(self, asset: Asset) -> Path:
         """A fresh scratch path for one resolution.

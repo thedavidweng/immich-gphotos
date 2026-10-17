@@ -100,8 +100,9 @@ class HttpImmichClient:
         # Stream to a sibling temp file and atomically replace dest only once the
         # whole body has landed. A partial file at dest would be indistinguishable
         # from a complete one to anything that later just checks existence, and
-        # since uploads are keyed on Immich's pre-computed checksum rather than a
-        # hash of the bytes we send, a truncated download becomes a corrupt upload
+        # since every Google-side consumer keys on hashes of real bytes (the
+        # resolver certifies each resolved file's SHA-1), a truncated download
+        # becomes either a correctly-failing hash read or a corrupt upload
         # recorded as "already present" forever.
         tmp = dest.with_suffix(dest.suffix + ".part")
         try:

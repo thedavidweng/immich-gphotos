@@ -152,6 +152,19 @@ def retry(asset_id: str, request: Request) -> dict:
     return {"retrying": asset_id}
 
 
+@router.post("/failures/retry-all")
+def retry_all(request: Request) -> dict:
+    """Return every quarantined asset to the queue at once.
+
+    For applying a fix to a backlog that failed wholesale -- the external-
+    library checksum mismatch being the canonical one: without a bulk
+    requeue, every quarantined row would have to be retried by hand."""
+    services: Services = request.state.services
+    count = services.assets.retry_all_failed()
+    services.events.add("info", f"bulk retry: {count} quarantined asset(s) requeued")
+    return {"requeued": count}
+
+
 def _settings_view(services: Services) -> dict:
     """The one true shape of "settings" as reported to a client: read off the
     live `Settings`, which already carries both the account half (quality,

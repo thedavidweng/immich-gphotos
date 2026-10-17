@@ -45,6 +45,7 @@ def _row_to_stored(row: sqlite3.Row) -> StoredAsset:
         last_error=row["last_error"],
         ineligible_reason=row["ineligible_reason"],
         favorite_synced=bool(row["favorite_synced"]) if row["favorite_synced"] is not None else None,
+        upload_sha1=row["upload_sha1"],
     )
 
 
@@ -160,15 +161,28 @@ class AssetRepo:
             ).fetchall()
         return [_row_to_stored(r) for r in rows]
 
-    def mark_synced(self, immich_id: str, media_key: str, outcome: Outcome) -> None:
+    def mark_synced(
+        self, immich_id: str, media_key: str, outcome: Outcome, upload_sha1: str | None = None
+    ) -> None:
+        """Record a synced asset.
+
+        `upload_sha1` is the base64 SHA-1 of the bytes described to Google
+        (the resolver-certified content hash). Passed whenever bytes were
+        resolved this round -- an upload or a content-hash dedup hit -- so
+        the delete path can trash by the key Google actually knows; left
+        None when the sync happened without touching bytes (checksum-keyed
+        dedup hits), where the fallback in `sync.deletions` applies.
+        """
         with self._conn.lock:
             self._conn.execute(
-                "UPDATE asset SET state = ?, outcome = ?, media_key = ?, synced_at = ?,"
-                " error_class = NULL, last_error = NULL, claimed_at = NULL WHERE immich_id = ?",
+                "UPDATE asset SET state = ?, outcome = ?, media_key = ?, upload_sha1 = ?,"
+                " synced_at = ?, error_class = NULL, last_error = NULL, claimed_at = NULL"
+                " WHERE immich_id = ?",
                 (
                     AssetState.SYNCED.value,
                     outcome.value,
                     media_key,
+                    upload_sha1,
                     self._clock.now().isoformat(),
                     immich_id,
                 ),
@@ -325,6 +339,23 @@ class AssetRepo:
                 (AssetState.PENDING.value, immich_id, AssetState.FAILED.value),
             )
             return cur.rowcount > 0
+
+    def retry_all_failed(self) -> int:
+        """Return every quarantined asset to the queue at once.
+
+        The same reset `retry_now` performs, for all FAILED rows in one
+        statement -- the bulk form exists for the ordinary case of a fix
+        landing after a class of uploads was failing for everyone (a remote
+        defect repaired on this side, say), where per-asset retries are not
+        a practical way back into the queue.
+        """
+        with self._conn.lock:
+            cur = self._conn.execute(
+                "UPDATE asset SET state = ?, attempts = 0, next_attempt_at = NULL,"
+                " error_class = NULL, last_error = NULL WHERE state = ?",
+                (AssetState.PENDING.value, AssetState.FAILED.value),
+            )
+            return cur.rowcount
 
     def requeue_stale_uploading(self, older_than: timedelta) -> int:
         """Recover rows a crash left claimed."""

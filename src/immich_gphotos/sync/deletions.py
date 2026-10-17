@@ -62,7 +62,13 @@ class DeletionSweeper:
             policy=self._settings.deletion_policy,
         )
         return DeletionPlan(
-            checksums=[c.asset.checksum for c in candidates],
+            # Google trashes by the dedup key derived from the content SHA-1
+            # it was given at upload. `upload_sha1` is exactly that for rows
+            # synced while the resolver hashed bytes; older rows' `checksum`
+            # is itself the content hash (internal uploads were always
+            # hashed by Immich, and any external upload that predated
+            # hashing failed with a checksum mismatch and so never synced).
+            checksums=[c.upload_sha1 or c.asset.checksum for c in candidates],
             asset_ids=[c.asset.immich_id for c in candidates],
             blocked=not ok,
             reason=reason,

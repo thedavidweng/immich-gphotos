@@ -33,6 +33,30 @@ def test_direct_read_is_used_when_the_original_path_exists(tmp_path):
     assert immich.downloads == []
 
 
+def test_resolve_certifies_the_content_sha1_of_the_bytes(tmp_path):
+    """Every resolution hands back the SHA-1 of the exact bytes at `path` --
+    the hash Google keys everything on. Immich's checksum ("sum-a") is only
+    ever a guess at content: External Library rows carry a sha1(path)
+    virtual checksum, so it must never be sent in its place."""
+    import base64
+    import hashlib
+
+    def sha1_b64(data: bytes) -> str:
+        return base64.b64encode(hashlib.sha1(data).digest()).decode()
+
+    original = tmp_path / "library" / "a.jpg"
+    original.parent.mkdir()
+    original.write_bytes(b"ABC")
+    resolver = ByteResolver(FakeImmichClient(contents={"a1": b"XYZ"}), scratch=tmp_path / "scratch")
+
+    direct = resolver.resolve(replace(ASSET, original_path=str(original)))
+    assert direct.sha1_b64 == sha1_b64(b"ABC")
+
+    downloaded = resolver.resolve(ASSET)
+    assert downloaded.temporary is True
+    assert downloaded.sha1_b64 == sha1_b64(b"XYZ")
+
+
 def test_falls_back_to_api_download_when_the_path_is_not_readable(tmp_path):
     immich = FakeImmichClient(contents={"a1": b"XYZ"})
     resolver = ByteResolver(immich, scratch=tmp_path / "scratch")

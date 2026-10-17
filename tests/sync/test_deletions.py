@@ -34,10 +34,10 @@ def rig(tmp_path):
     return assets, gphotos
 
 
-def sync_asset(assets: AssetRepo, i: str) -> None:
+def sync_asset(assets: AssetRepo, i: str, upload_sha1: str | None = None) -> None:
     assets.upsert_pending(asset(i), Priority.WEBHOOK)
     assets.claim_next(limit=1)
-    assets.mark_synced(i, f"key-{i}", Outcome.UPLOADED)
+    assets.mark_synced(i, f"key-{i}", Outcome.UPLOADED, upload_sha1=upload_sha1)
 
 
 def trash_asset(assets: AssetRepo, i: str) -> None:
@@ -103,13 +103,31 @@ def test_enabled_sweeper_trashes_in_google_and_marks_the_row(rig):
 
     sweeper = DeletionSweeper(gphotos, assets, Settings(deletions_enabled=True))
     plan = sweeper.plan()
-    assert plan.checksums == ["sum-a"]
+    assert plan.checksums == ["sum-a"]  # rows without upload_sha1 fall back to checksums
     assert sweeper.execute(plan) == 1
     assert gphotos.trashed == ["sum-a"]
     stored = assets.get("a")
     assert stored.state is AssetState.INELIGIBLE
     assert stored.ineligible_reason == "deleted_from_immich"
     assert stored.media_key == "key-a"  # kept, so a re-add resolves instantly
+
+
+def test_rows_with_an_upload_sha1_trash_by_the_content_hash(rig):
+    """Google pairs dedup-key trash with the content SHA-1 it was given at
+    upload. An External Library row's Immich checksum is sha1(path) -- no
+    Google item answers to it -- so the sweeper must trash by the hash the
+    worker recorded when the bytes went up."""
+    assets, gphotos = rig
+    sync_asset(assets, "a", upload_sha1="content-a")
+    for i in range(19):
+        sync_asset(assets, f"b{i}")
+    trash_asset(assets, "a")
+
+    sweeper = DeletionSweeper(gphotos, assets, Settings(deletions_enabled=True))
+    plan = sweeper.plan()
+    assert plan.checksums == ["content-a"]
+    assert sweeper.execute(plan) == 1
+    assert gphotos.trashed == ["content-a"]
 
 
 def test_blocked_plan_refuses_to_execute(rig):

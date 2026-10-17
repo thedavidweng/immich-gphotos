@@ -60,11 +60,18 @@ def _minimal_heic_still() -> bytes:
     return (Path(__file__).with_name("fixtures") / "small.heic").read_bytes()
 
 
+def _sha1_b64(data: bytes) -> str:
+    return base64.b64encode(hashlib.sha1(data).digest()).decode()
+
+
+def _still_hash() -> str:
+    return _sha1_b64(STILL_BYTES)
+
+
 def _muxed_hash() -> str:
     from immich_gphotos.sync.livephoto import build_motion_photo_jpeg
 
-    muxed = build_motion_photo_jpeg(STILL_BYTES, VIDEO_BYTES)
-    return base64.b64encode(hashlib.sha1(muxed).digest()).decode()
+    return _sha1_b64(build_motion_photo_jpeg(STILL_BYTES, VIDEO_BYTES))
 
 
 def _rig(tmp_path):
@@ -127,7 +134,7 @@ def test_missing_companion_falls_back_to_the_still_alone(tmp_path):
     result = worker.process(assets.claim_next(limit=1)[0])
 
     assert result.state is AssetState.SYNCED
-    assert gphotos.uploads == [("sum-still", "IMG_1.JPG")]
+    assert gphotos.uploads == [(_still_hash(), "IMG_1.JPG")]
 
 
 def test_heic_still_falls_back_without_pairing(tmp_path):
@@ -143,7 +150,7 @@ def test_heic_still_falls_back_without_pairing(tmp_path):
     result = worker.process(assets.claim_next(limit=1)[0])
 
     assert result.state is AssetState.SYNCED
-    assert gphotos.uploads == [("sum-still", "IMG_1.JPG")]
+    assert gphotos.uploads == [(_sha1_b64(heic), "IMG_1.JPG")]
     assert assets.get("mov-1").ineligible_reason != LIVE_PHOTO_PAIRED_REASON
 
 
@@ -206,7 +213,7 @@ def test_heic_falls_back_when_exiftool_is_missing_or_refuses(tmp_path):
         result = worker.process(assets.claim_next(limit=1)[0])
 
         assert result.state is AssetState.SYNCED
-        assert gphotos.uploads == [("sum-still", "IMG_1.HEIC")]
+        assert gphotos.uploads == [(_sha1_b64(heic_bytes), "IMG_1.HEIC")]
         assert assets.get("mov-1").ineligible_reason != LIVE_PHOTO_PAIRED_REASON
 
 

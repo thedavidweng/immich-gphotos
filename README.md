@@ -20,7 +20,7 @@ It exists for one situation in particular: you've moved to Immich, you're happy 
 ## Why you might want it
 
 - 📸 **Every new photo, automatically.** Immich's own workflow system pushes new assets across the moment they land. No polling loop, no cron job, no export scripts.
-- ⚡ **It won't re-upload your library.** Immich stores a SHA-1 checksum of every original, and that is exactly what Google Photos deduplicates on. Before moving a single byte it asks Google "do you already have this?" For most people — whose phone was uploading to Google long before they found Immich — the answer is usually yes, and the backfill costs almost no bandwidth.
+- ⚡ **It won't re-upload your library.** Before moving a single byte it computes the SHA-1 of the asset's own bytes and asks Google "do you already have this?" — which means it works with Immich External Library assets too, whose database checksum is a `sha1(path)` placeholder rather than a content hash. For most people — whose phone was uploading to Google long before they found Immich — the answer is usually yes, and the backfill costs almost no bandwidth.
 - 🛟 **It notices what the webhook missed.** Immich's webhooks are fire-and-forget and never retried. A reconciler re-reads everything Immich changed since its last *complete* pass, so an asset created while the container was down still gets backed up. Nothing is ever known only by a webhook.
 - 🖼️ **Motion photos stay motion photos.** Immich splits the video out of a motion photo into a separate hidden asset and leaves the original JPEG untouched. This uploads that original with its motion payload intact, and skips the extracted clip — so you don't end up with stray one-second videos in your timeline. Apple Live Photos (JPEG *and* HEIC stills) are muxed with their companion `.MOV` into Google Motion Photos before upload; anything unmuxable falls back to the still alone. (HEIC muxing writes its XMP through ExifTool, which ships in the image — source installs outside Docker need `libimage-exiftool-perl` for that path only.)
 - 🗂️ **Albums come along.** Immich albums are recreated in Google Photos and kept in step, including splitting anything past Google's 20,000-item album limit.
@@ -252,7 +252,7 @@ The asset table *is* the work queue, so there's no second store to drift out of 
 Tested end to end against a real Immich 3.2.2 instance and a real Google Photos account:
 
 - ✅ The `AssetCreate` webhook fires and its payload parses, including the `Buffer`-shaped checksum field.
-- ✅ That checksum is the SHA-1 of the original file — the assumption the entire dedup design rests on.
+- ✅ Upload integrity: the upload hash is the SHA-1 of the actual bytes hashed by the service itself before transfer — not Immich's checksum field, which is the file's SHA-1 only for internal uploads and a `sha1(path)` virtual value for External Library assets (`checksumAlgorithm: sha1-path`). Checking real uploaded bytes against real uploaded bytes.
 - ✅ A hash Google already holds is recognised without uploading anything.
 - ✅ Upload, dedup lookup and trash all work through the real API.
 - ✅ Motion photos: with real Pixel and Samsung samples, Immich extracts the video into a hidden asset, leaves the original JPEG byte-identical, and the eligibility rule uploads the still while skipping the clip.

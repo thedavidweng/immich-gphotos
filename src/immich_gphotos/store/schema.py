@@ -42,7 +42,15 @@ CREATE TABLE IF NOT EXISTS asset (
   -- For an Apple Live Photo still, the Immich id of the companion `.MOV`
   -- (`Asset.live_photo_video_id`). The still and its motion are muxed into
   -- one Google Motion Photo before upload -- see `sync.livephoto`.
-  live_photo_video_id TEXT
+  live_photo_video_id TEXT,
+  -- The base64 SHA-1 of the bytes actually described to Google when this
+  -- row synced -- the hash every Google-side operation keys on (dedup
+  -- lookup, X-Goog-Hash, trash-by-dedup-key). Immich's own `checksum`
+  -- column is that hash only for internal uploads; External Library rows
+  -- carry a virtual sha1(path) checksum, so the delete path sends this
+  -- column when set and falls back to `checksum` otherwise (for which it
+  -- is exact). See sync.bytes and sync.deletions.
+  upload_sha1 TEXT
 );
 CREATE INDEX IF NOT EXISTS asset_queue ON asset(state, priority, next_attempt_at);
 CREATE INDEX IF NOT EXISTS asset_checksum ON asset(checksum);
@@ -84,6 +92,7 @@ COLUMN_MIGRATIONS: tuple[tuple[str, str, str], ...] = (
     ("asset", "is_favorite", "ALTER TABLE asset ADD COLUMN is_favorite INTEGER NOT NULL DEFAULT 0"),
     ("asset", "favorite_synced", "ALTER TABLE asset ADD COLUMN favorite_synced INTEGER"),
     ("asset", "live_photo_video_id", "ALTER TABLE asset ADD COLUMN live_photo_video_id TEXT"),
+    ("asset", "upload_sha1", "ALTER TABLE asset ADD COLUMN upload_sha1 TEXT"),
 )
 
 

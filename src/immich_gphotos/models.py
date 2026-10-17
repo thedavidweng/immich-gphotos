@@ -113,3 +113,9 @@ class StoredAsset:
     # Compared against `asset.is_favorite` by the favorite sweeper to find
     # drift without re-uploading bytes -- see `sync.favorites`.
     favorite_synced: bool | None = None
+    # The base64 SHA-1 of the bytes described to Google when this row synced
+    # (None for rows synced without resolving bytes -- dedup hits -- or by
+    # older versions). Every Google-side consumer keys on it; the delete
+    # path falls back to `asset.checksum`, which is exact for the rows
+    # synced before hashing existed. See `sync.deletions`.
+    upload_sha1: str | None = None

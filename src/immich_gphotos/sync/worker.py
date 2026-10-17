@@ -1,5 +1,3 @@
-import base64
-import hashlib
 import logging
 import threading
 import time
@@ -47,24 +45,6 @@ WINDOW_RETRY_DELAY = timedelta(minutes=15)
 MAX_INLINE_THROTTLE_WAIT_SECONDS = 30.0
 
 logger = logging.getLogger(__name__)
-
-
-def _sha1_base64_of_file(path: Path) -> str | None:
-    """Base64 SHA-1 of the file at `path`, or None when it cannot be read.
-
-    Chunked so a tens-of-megabytes muxed Motion Photo never sits in memory
-    twice. Only used for the muxed-upload hash -- ordinary uploads reuse the
-    precomputed Immich checksum without touching the bytes.
-    """
-    digest = hashlib.sha1()
-    try:
-        with path.open("rb") as handle:
-            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-                digest.update(chunk)
-    except OSError as exc:
-        logger.debug("could not hash %s: %s", path.name, exc)
-        return None
-    return base64.b64encode(digest.digest()).decode("ascii")
 
 
 @dataclass(frozen=True)
@@ -190,12 +170,18 @@ class Worker:
                 return WorkerResult(AssetState.SYNCED, Outcome.ALREADY_PRESENT, local_key)
 
             try:
+                # Immich's checksum keyed against Google's content-hash
+                # index: exact only for Internal uploads (whose checksum IS
+                # the content hash), where it can clear an asset without
+                # ever resolving bytes. External Library checksums are
+                # sha1(path) and lookups on them reliably miss -- the
+                # authoritative content-hash check runs right after resolve,
+                # when the real bytes' hash is available.
                 remote_key = self._gphotos.exists(asset.checksum)
                 if remote_key:
                     self._assets.mark_synced(asset.immich_id, remote_key, Outcome.ALREADY_PRESENT)
                     self._star_if_favorited(asset, remote_key)
                     return WorkerResult(AssetState.SYNCED, Outcome.ALREADY_PRESENT, remote_key)
-
                 if not transfer_allowed:
                     # Neither dedup check cleared it for free -- this asset
                     # genuinely needs bytes moved. That's the one thing the
@@ -222,34 +208,36 @@ class Worker:
 
                 resolved = self._resolver.resolve(asset)
                 try:
-                    upload_checksum = asset.checksum
-                    if resolved.paired_video_id is not None:
-                        # A muxed Motion Photo's bytes differ from the still's,
-                        # so the still's hash would misdescribe them to Google.
-                        # Describe the bytes actually going up; the still's own
-                        # hash already had its say in both dedup checks above.
-                        muxed_checksum = _sha1_base64_of_file(resolved.path)
-                        if muxed_checksum is None:
-                            # Could not hash (file vanished mid-upload?) --
-                            # fall back to the still's hash rather than failing
-                            # the backup over bookkeeping.
-                            pass
-                        else:
-                            upload_checksum = muxed_checksum
-                            try:
-                                muxed_remote = self._gphotos.exists(muxed_checksum)
-                            except GPhotosError:
-                                raise
-                            except Exception as exc:  # noqa: BLE001 - a dedup miss just uploads
-                                logger.debug("muxed hash lookup failed for %s: %s", asset.immich_id, exc)
-                                muxed_remote = None
-                            if muxed_remote:
-                                self._assets.mark_synced(
-                                    asset.immich_id, muxed_remote, Outcome.ALREADY_PRESENT
-                                )
-                                self._mark_paired(resolved.paired_video_id)
-                                self._star_if_favorited(asset, muxed_remote)
-                                return WorkerResult(AssetState.SYNCED, Outcome.ALREADY_PRESENT, muxed_remote)
+                    # The resolver certified the SHA-1 of these exact bytes.
+                    # That is the hash every Google-side consumer keys on --
+                    # dedup lookup, upload integrity, trash -- and Immich's
+                    # own checksum is that hash only for Internal uploads
+                    # (External Library rows carry a virtual sha1(path)
+                    # checksum that does not describe any real bytes). One
+                    # hash lookup against the resolved bytes covers ordinary
+                    # uploads and muxed Motion Photos alike.
+                    content_hash = resolved.sha1_b64
+                    assert content_hash is not None  # resolve() always certifies the bytes
+                    content_remote: str | None
+                    try:
+                        content_remote = self._gphotos.exists(content_hash)
+                    except GPhotosError:
+                        raise
+                    except Exception as exc:  # noqa: BLE001 - a dedup miss just uploads
+                        logger.debug("content hash lookup failed for %s: %s", asset.immich_id, exc)
+                        content_remote = None
+                    if content_remote:
+                        self._assets.mark_synced(
+                            asset.immich_id,
+                            content_remote,
+                            Outcome.ALREADY_PRESENT,
+                            upload_sha1=content_hash,
+                        )
+                        if resolved.paired_video_id is not None:
+                            self._mark_paired(resolved.paired_video_id)
+                        self._star_if_favorited(asset, content_remote)
+                        return WorkerResult(AssetState.SYNCED, Outcome.ALREADY_PRESENT, content_remote)
+
                     defer_wait = self._throttle_upload(asset.immich_id, resolved.path)
                     if defer_wait is not None:
                         # The bandwidth cap would otherwise block this thread
@@ -300,16 +288,18 @@ class Worker:
                     if self._gate is not None:
                         with self._gate:
                             media_key = self._gphotos.upload(
-                                resolved.path, checksum=upload_checksum, filename=asset.filename
+                                resolved.path, checksum=content_hash, filename=asset.filename
                             )
                     else:
                         media_key = self._gphotos.upload(
-                            resolved.path, checksum=upload_checksum, filename=asset.filename
+                            resolved.path, checksum=content_hash, filename=asset.filename
                         )
                 finally:
                     self._resolver.release(resolved)
 
-                self._assets.mark_synced(asset.immich_id, media_key, Outcome.UPLOADED)
+                self._assets.mark_synced(
+                    asset.immich_id, media_key, Outcome.UPLOADED, upload_sha1=content_hash
+                )
                 self._star_if_favorited(asset, media_key)
                 if resolved.paired_video_id is not None:
                     self._mark_paired(resolved.paired_video_id)
