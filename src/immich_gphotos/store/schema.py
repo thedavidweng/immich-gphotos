@@ -103,3 +103,13 @@ def apply_migrations(
         columns = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
         if column not in columns:
             conn.execute(ddl)
+
+    # Legacy cleanup: historical builds recorded assets trashed in Immich with
+    # state = 'trashed'. The AssetState enum has since retired that variant in
+    # favour of INELIGIBLE + ineligible_reason = 'deleted_from_immich'. Migrate
+    # any existing rows forward so AssetState(row["state"]) does not raise
+    # during reconcile passes.
+    conn.execute(
+        "UPDATE asset SET state = 'ineligible', ineligible_reason = 'deleted_from_immich'"
+        " WHERE state = 'trashed'"
+    )
