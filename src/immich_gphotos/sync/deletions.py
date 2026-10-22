@@ -79,6 +79,13 @@ class DeletionSweeper:
             return candidate.asset.checksum
         return None
 
+    def _still_backs_up_something_else(self, media_key: str, leaving: set[str]) -> bool:
+        """Whether a live Immich asset outside `leaving` still maps to `media_key`."""
+        return any(
+            r.asset.immich_id not in leaving and r.state is AssetState.SYNCED and not r.asset.is_trashed
+            for r in self._assets.rows_for_media_key(media_key)
+        )
+
     def plan(self) -> DeletionPlan:
         if not self._settings.deletions_enabled:
             return DeletionPlan()
@@ -124,23 +131,40 @@ class DeletionSweeper:
                 checksums.append(content_hash)
                 planned_keys.add(c.media_key)
             asset_ids.append(c.asset.immich_id)
-            # A Motion Photo built for this still *in addition to* its own
-            # item (a derived_motion reprocess) is the same photo: it goes
-            # with it, by its own recorded hash -- never inferred from the
-            # still's.
+            # The Live Photo's other Google items go with the still, by
+            # their own recorded hashes -- never inferred from the still's:
+            #  * a Motion Photo built *in addition to* the still's own item
+            #    (a derived_motion reprocess);
+            #  * the original `.MOV` uploaded as its own item (original_pair).
+            #    Immich hides that clip and does not reliably report it as
+            #    trashed when the Live Photo is deleted, so its lifecycle
+            #    follows the still's here instead of waiting for that.
             live = self._assets.live_photo(c.asset.immich_id)
-            if (
-                live is not None
-                and live["derived_sha1"]
-                and live["derived_media_key"]
-                and live["derived_media_key"] != c.media_key
-                and live["derived_media_key"] not in planned_keys
-            ):
-                checksums.append(live["derived_sha1"])
-                planned_keys.add(live["derived_media_key"])
+            if live is None:
+                continue
+            extras: list[tuple[str | None, str | None, str | None]] = [
+                (live["derived_media_key"], live["derived_sha1"], None),
+                (live["video_media_key"], live["video_sha1"], live["video_id"]),
+            ]
+            for extra_key, extra_hash, extra_row in extras:
+                if not extra_key or extra_key == c.media_key or extra_key in planned_keys:
+                    continue
+                if self._still_backs_up_something_else(extra_key, trashing | {extra_row} - {None}):
+                    continue
+                if not extra_hash and extra_row:
+                    companion = self._assets.get(extra_row)
+                    if companion is not None and companion.media_key == extra_key:
+                        extra_hash = companion.upload_sha1 or self._verified_legacy_hash(companion)
+                if not extra_hash:
+                    unverified.append(extra_row or c.asset.immich_id)
+                    continue
+                checksums.append(extra_hash)
+                planned_keys.add(extra_key)
+                if extra_row and extra_row not in asset_ids and self._assets.get(extra_row) is not None:
+                    asset_ids.append(extra_row)
         return DeletionPlan(
             checksums=checksums,
-            asset_ids=asset_ids,
+            asset_ids=list(dict.fromkeys(asset_ids)),
             blocked=False,
             reason=reason,
             retained_ids=retained,

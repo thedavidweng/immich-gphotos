@@ -211,3 +211,74 @@ def test_a_derived_motion_photo_added_by_reprocess_is_trashed_with_its_still(rig
     trash_asset(assets, "still")
     plan = DeletionSweeper(gphotos, assets, Settings(deletions_enabled=True)).plan()
     assert plan.checksums == ["content-still", "content-derived"]
+
+
+def _original_pair(assets, *, mov_hash="content-mov", trash_mov=False):
+    sync_asset(assets, "still", upload_sha1="content-still")
+    sync_asset(assets, "mov", upload_sha1=mov_hash)  # the hidden clip, its own Google item
+    assets.record_live_photo(
+        "still",
+        "mov",
+        mode="original_pair",
+        status="complete",
+        still_sha1="content-still",
+        video_sha1=mov_hash,
+        video_media_key="key-mov",
+    )
+    trash_asset(assets, "still")
+    if trash_mov:
+        trash_asset(assets, "mov")
+
+
+def test_original_pair_mov_is_trashed_with_its_still_even_if_immich_never_reports_it(rig):
+    assets, gphotos = rig
+    _big_library(assets)
+    _original_pair(assets)  # Immich reported the still trashed, never the hidden .MOV
+    sweeper = DeletionSweeper(gphotos, assets, Settings(deletions_enabled=True))
+    plan = sweeper.plan()
+    assert plan.checksums == ["content-still", "content-mov"]
+    assert plan.asset_ids == ["still", "mov"]
+    sweeper.execute(plan)
+    assert gphotos.trashed == ["content-still", "content-mov"]
+    assert assets.get("mov").ineligible_reason == "deleted_from_immich"
+    # Nothing left to do on the next tick: no double trash.
+    assert sweeper.plan().checksums == []
+
+
+def test_original_pair_mov_reported_trashed_too_is_trashed_once(rig):
+    assets, gphotos = rig
+    _big_library(assets)
+    _original_pair(assets, trash_mov=True)
+    plan = DeletionSweeper(gphotos, assets, Settings(deletions_enabled=True)).plan()
+    assert sorted(plan.checksums) == ["content-mov", "content-still"]
+    assert sorted(plan.asset_ids) == ["mov", "still"]
+
+
+def test_original_pair_mov_still_backing_up_another_asset_is_kept(rig):
+    assets, gphotos = rig
+    _big_library(assets)
+    _original_pair(assets)
+    assets.upsert_pending(asset("other-copy"), Priority.WEBHOOK)
+    assets.claim_next(limit=1)
+    assets.mark_synced("other-copy", "key-mov", Outcome.ALREADY_PRESENT, upload_sha1="content-mov")
+    plan = DeletionSweeper(gphotos, assets, Settings(deletions_enabled=True)).plan()
+    assert plan.checksums == ["content-still"]
+    assert plan.asset_ids == ["still"]
+
+
+def test_original_pair_mov_without_a_provable_hash_fails_closed(rig):
+    assets, gphotos = rig
+    _big_library(assets)
+    sync_asset(assets, "still", upload_sha1="content-still")
+    sync_asset(assets, "mov")  # legacy: no upload hash, Google does not confirm its checksum
+    assets.record_live_photo(
+        "still", "mov", mode="original_pair", status="complete", video_media_key="key-mov"
+    )
+    trash_asset(assets, "still")
+    plan = DeletionSweeper(gphotos, assets, Settings(deletions_enabled=True)).plan()
+    assert plan.checksums == ["content-still"]
+    assert plan.unverified_ids == ["mov"]
+
+    gphotos.present["sum-mov"] = "key-mov"  # now Google confirms the mapping
+    plan = DeletionSweeper(gphotos, assets, Settings(deletions_enabled=True)).plan()
+    assert plan.checksums == ["content-still", "sum-mov"]
