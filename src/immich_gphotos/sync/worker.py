@@ -16,6 +16,7 @@ from immich_gphotos.store.assets import AssetRepo
 from immich_gphotos.sync.backoff import next_delay, should_quarantine
 from immich_gphotos.sync.bytes import ByteResolver, SourceChangedError
 from immich_gphotos.sync.eligibility import check_eligibility
+from immich_gphotos.sync.favorites import FavoriteSyncer
 from immich_gphotos.sync.livephoto import LIVE_PHOTO_PAIRED_REASON
 from immich_gphotos.sync.throttle import TokenBucket
 
@@ -74,6 +75,7 @@ class Worker:
         gate: AbstractContextManager[Any] | None = None,
         sleep: Callable[[float], None] = time.sleep,
         favorites_enabled: bool = True,
+        favorites: FavoriteSyncer | None = None,
     ) -> None:
         self._assets = assets
         self._gphotos = gphotos
@@ -102,6 +104,10 @@ class Worker:
         # set_favorite and every drift waits for the sweeper -- which itself
         # is gated on the same flag in `BackgroundLoops`, so off is fully off.
         self._favorites_enabled = favorites_enabled
+        # The per-item favorite reconciler shared with the sweeper, so the
+        # immediate star and the periodic sweep serialise on the same item
+        # lock and read/write the same per-item ledger.
+        self._favorites = favorites if favorites is not None else FavoriteSyncer(gphotos, assets)
         # Ids for which a previous call already charged the bucket (via
         # `TokenBucket.take`) but deferred rather than sleeping out the
         # result -- see `_throttle_upload`. When such an asset is reclaimed,
@@ -348,14 +354,11 @@ class Worker:
         if not self._favorites_enabled or not asset.is_favorite:
             return
         try:
-            self._gphotos.set_favorite(media_key, True)
+            # Per Google item, merged across every row that dedups onto it --
+            # see FavoriteSyncer. Starring is always safe to do immediately.
+            self._favorites.reconcile_key(media_key)
         except Exception as exc:  # noqa: BLE001 - a star is never worth failing a backup over
             logger.debug("could not star %s in Google Photos: %s", asset.immich_id, exc)
-            return
-        try:
-            self._assets.mark_favorite_synced(asset.immich_id, True)
-        except Exception as exc:  # noqa: BLE001 - the next sweep will simply retry
-            logger.debug("could not record favorite for %s: %s", asset.immich_id, exc)
 
     def _mark_paired(self, companion_id: str) -> None:
         """Account for a companion `.MOV` folded into its still's upload.

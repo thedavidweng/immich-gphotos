@@ -137,6 +137,7 @@ def build_runtime_graph(
         assets=assets,
         xmp=ExifToolMotionPhotoXmp.if_available(),
     )
+    favorite_syncer = FavoriteSyncer(gphotos, assets)
     worker = Worker(
         assets,
         gphotos,
@@ -147,6 +148,7 @@ def build_runtime_graph(
         bandwidth=bandwidth,
         gate=gate,
         favorites_enabled=settings.favorites_enabled,
+        favorites=favorite_syncer,
     )
     runtime = Runtime(assets, worker, settings, clock, events, immich=immich)
     backfill = BackfillJob(immich, assets, cursors, settings)
@@ -160,7 +162,7 @@ def build_runtime_graph(
         clock=clock,
         events=events,
         assets=assets,
-        favorite_syncer=FavoriteSyncer(gphotos, assets),
+        favorite_syncer=favorite_syncer,
     )
     return runtime, backfill, loops
 

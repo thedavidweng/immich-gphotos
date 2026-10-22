@@ -406,6 +406,107 @@ class AssetRepo:
                 (int(is_favorite), immich_id),
             )
 
+    def rows_for_media_key(self, media_key: str) -> list[StoredAsset]:
+        """Every row, in any state, that maps onto one Google item."""
+        with self._conn.lock:
+            rows = self._conn.execute(
+                "SELECT * FROM asset WHERE media_key = ? ORDER BY first_seen_at ASC", (media_key,)
+            ).fetchall()
+        return [_row_to_stored(r) for r in rows]
+
+    def media_key_uploaded_here(self, media_key: str) -> bool:
+        """Whether this service itself created the Google item (an UPLOADED row)."""
+        with self._conn.lock:
+            row = self._conn.execute(
+                "SELECT 1 FROM asset WHERE media_key = ? AND outcome = ? LIMIT 1",
+                (media_key, Outcome.UPLOADED.value),
+            ).fetchone()
+        return row is not None
+
+    def favorite_remote(self, media_key: str) -> sqlite3.Row | None:
+        with self._conn.lock:
+            return self._conn.execute(
+                "SELECT * FROM favorite_remote WHERE media_key = ?", (media_key,)
+            ).fetchone()
+
+    def record_favorite_remote(
+        self,
+        media_key: str,
+        *,
+        pushed: bool | None,
+        managed: bool,
+        intent: bool | None,
+    ) -> None:
+        """Upsert the per-item favorite ledger (see the favorite_remote table)."""
+        with self._conn.lock:
+            self._conn.execute(
+                "INSERT INTO favorite_remote (media_key, pushed, managed, intent, evaluated_at)"
+                " VALUES (?,?,?,?,?)"
+                " ON CONFLICT(media_key) DO UPDATE SET pushed = excluded.pushed,"
+                "  managed = excluded.managed, intent = excluded.intent,"
+                "  evaluated_at = excluded.evaluated_at",
+                (
+                    media_key,
+                    None if pushed is None else int(pushed),
+                    int(managed),
+                    None if intent is None else int(intent),
+                    self._clock.now().isoformat(),
+                ),
+            )
+
+    def touch_favorite_remote(self, media_key: str) -> None:
+        """Note that an item was looked at but deliberately left alone (held)."""
+        with self._conn.lock:
+            self._conn.execute(
+                "INSERT INTO favorite_remote (media_key, evaluated_at) VALUES (?, ?)"
+                " ON CONFLICT(media_key) DO UPDATE SET evaluated_at = excluded.evaluated_at",
+                (media_key, self._clock.now().isoformat()),
+            )
+
+    def settle_favorite_row(self, immich_id: str, is_favorite: bool) -> bool:
+        """Mark one row's star as reconciled -- only if it has not changed since.
+
+        Compare-and-set on `is_favorite`: a webhook that flipped the star
+        while a push for the old value was in flight leaves the row drifted
+        for the next sweep instead of being recorded as settled.
+        """
+        with self._conn.lock:
+            cur = self._conn.execute(
+                "UPDATE asset SET favorite_synced = ? WHERE immich_id = ? AND is_favorite = ?",
+                (int(is_favorite), immich_id, int(is_favorite)),
+            )
+            return cur.rowcount > 0
+
+    def favorite_candidate_keys(self, limit: int = 2000) -> list[str]:
+        """Google items whose star may need a decision this sweep.
+
+        An item is a candidate when the merged intent of its live rows (any
+        SYNCED, non-trashed row starred -> starred) differs from the intent
+        last settled for it, or -- for an item the ledger has never seen --
+        when it is starred or one of its rows carries row-level drift from
+        before the ledger existed. Items with no live row at all (everything
+        trashed or gone) are never candidates: nothing here ever unstars an
+        item because its sources went missing. Least recently evaluated
+        first, so held items rotate rather than starve the rest.
+        """
+        with self._conn.lock:
+            rows = self._conn.execute(
+                "WITH desired AS ("
+                "  SELECT media_key, MAX(is_favorite) AS fav FROM asset"
+                "  WHERE media_key IS NOT NULL AND state = ? AND is_trashed = 0"
+                "  GROUP BY media_key"
+                ")"
+                " SELECT d.media_key FROM desired d"
+                " LEFT JOIN favorite_remote f ON f.media_key = d.media_key"
+                " WHERE (f.media_key IS NULL AND (d.fav = 1 OR EXISTS ("
+                "     SELECT 1 FROM asset a WHERE a.media_key = d.media_key"
+                "     AND a.favorite_synced IS NOT NULL AND a.favorite_synced != a.is_favorite)))"
+                "  OR (f.media_key IS NOT NULL AND (f.intent IS NULL OR f.intent != d.fav))"
+                " ORDER BY f.evaluated_at IS NOT NULL, f.evaluated_at ASC LIMIT ?",
+                (AssetState.SYNCED.value, limit),
+            ).fetchall()
+        return [r["media_key"] for r in rows]
+
     def favorite_drift(self, limit: int = 500) -> list[StoredAsset]:
         """SYNCED rows whose star Google does not know about yet.
 

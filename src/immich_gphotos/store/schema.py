@@ -60,6 +60,28 @@ CREATE TABLE IF NOT EXISTS asset (
 );
 CREATE INDEX IF NOT EXISTS asset_queue ON asset(state, priority, next_attempt_at);
 CREATE INDEX IF NOT EXISTS asset_checksum ON asset(checksum);
+CREATE INDEX IF NOT EXISTS asset_media_key ON asset(media_key);
+
+-- What this service has told Google about one remote item's star, keyed by
+-- Google media key rather than by Immich asset: several Immich assets can
+-- dedup onto the same Google item, so starring is reconciled per item, from
+-- the merged intent of every row that maps to it (see sync.favorites).
+--   pushed     last value a set_favorite call confirmed (NULL: never sent)
+--   managed    1 once this service's own star is provably what is on the
+--              item (it starred an item it uploaded itself). Only managed
+--              items are ever unstarred: an item that was already in Google
+--              may carry a star the user set there by hand.
+--   intent     the merged target last settled for this item (NULL: never
+--              settled, or held because the source set was incomplete)
+--   evaluated_at  when the sweeper last looked, so held items rotate
+--              instead of starving the rest of the sweep.
+CREATE TABLE IF NOT EXISTS favorite_remote (
+  media_key    TEXT PRIMARY KEY,
+  pushed       INTEGER,
+  managed      INTEGER NOT NULL DEFAULT 0,
+  intent       INTEGER,
+  evaluated_at TEXT
+);
 
 CREATE TABLE IF NOT EXISTS album_map (
   immich_album_id TEXT PRIMARY KEY,
