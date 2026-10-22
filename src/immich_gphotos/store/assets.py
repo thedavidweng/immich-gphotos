@@ -406,6 +406,201 @@ class AssetRepo:
                 (int(is_favorite), immich_id),
             )
 
+    # --- Live Photos (see the live_photo table) -----------------------------
+
+    _LIVE_FIELDS = (
+        "still_sha1",
+        "video_sha1",
+        "video_media_key",
+        "derived_sha1",
+        "derived_media_key",
+    )
+
+    def live_photo(self, still_id: str) -> sqlite3.Row | None:
+        with self._conn.lock:
+            return self._conn.execute("SELECT * FROM live_photo WHERE still_id = ?", (still_id,)).fetchone()
+
+    def record_live_photo(
+        self,
+        still_id: str,
+        video_id: str,
+        *,
+        mode: str,
+        status: str,
+        reason: str | None = None,
+        attempts: int | None = None,
+        next_attempt_at: datetime | None = None,
+        **identities: str | None,
+    ) -> None:
+        """Upsert one Live Photo's state. Identity columns not passed are kept."""
+        unknown = set(identities) - set(self._LIVE_FIELDS)
+        if unknown:
+            raise ValueError(f"unknown live_photo fields: {sorted(unknown)}")
+        now = self._clock.now().isoformat()
+        cols = ["still_id", "video_id", "mode", "status", "reason", "next_attempt_at", "updated_at"]
+        vals: list[object] = [
+            still_id,
+            video_id,
+            mode,
+            status,
+            reason,
+            next_attempt_at.isoformat() if next_attempt_at else None,
+            now,
+        ]
+        if attempts is not None:
+            cols.append("attempts")
+            vals.append(attempts)
+        for key, value in identities.items():
+            cols.append(key)
+            vals.append(value)
+        updates = ", ".join(f"{c} = excluded.{c}" for c in cols if c != "still_id")
+        with self._conn.lock:
+            self._conn.execute(
+                f"INSERT INTO live_photo ({', '.join(cols)}) VALUES ({', '.join('?' for _ in cols)})"
+                f" ON CONFLICT(still_id) DO UPDATE SET {updates}",
+                vals,
+            )
+
+    def live_photo_for_video(self, video_id: str) -> sqlite3.Row | None:
+        with self._conn.lock:
+            return self._conn.execute(
+                "SELECT * FROM live_photo WHERE video_id = ? ORDER BY updated_at DESC LIMIT 1", (video_id,)
+            ).fetchone()
+
+    def live_photos_due(self, mode: str, limit: int = 50) -> list[sqlite3.Row]:
+        """Pending Live Photos under `mode` whose still is SYNCED and whose retry is due."""
+        now = self._clock.now().isoformat()
+        with self._conn.lock:
+            return self._conn.execute(
+                "SELECT l.* FROM live_photo l JOIN asset a ON a.immich_id = l.still_id"
+                " WHERE l.mode = ? AND l.status = 'pending' AND a.state = ?"
+                " AND (l.next_attempt_at IS NULL OR l.next_attempt_at <= ?)"
+                " ORDER BY l.updated_at ASC LIMIT ?",
+                (mode, AssetState.SYNCED.value, now, limit),
+            ).fetchall()
+
+    def live_photo_summary(self) -> dict:
+        """Read-only plan: Live Photo states, and SYNCED stills never assessed.
+
+        `untracked_synced_stills` counts stills synced before Live Photo
+        tracking existed (or under a build that did not record it): their
+        motion was never backed up by this service. Nothing here changes
+        them; `request_live_photo_reprocess` is the explicit way to.
+        """
+        with self._conn.lock:
+            groups = self._conn.execute(
+                "SELECT mode, status, reason, COUNT(*) AS n FROM live_photo"
+                " GROUP BY mode, status, reason ORDER BY mode, status, reason"
+            ).fetchall()
+            untracked = self._conn.execute(
+                "SELECT COUNT(*) AS n FROM asset a WHERE a.state = ? AND a.live_photo_video_id IS NOT NULL"
+                " AND NOT EXISTS (SELECT 1 FROM live_photo l WHERE l.still_id = a.immich_id)",
+                (AssetState.SYNCED.value,),
+            ).fetchone()["n"]
+        return {
+            "groups": [
+                {"mode": g["mode"], "status": g["status"], "reason": g["reason"], "count": g["n"]}
+                for g in groups
+            ],
+            "untracked_synced_stills": untracked,
+        }
+
+    def request_live_photo_reprocess(self, mode: str, still_ids: Sequence[str] | None = None) -> int:
+        """Explicitly queue SYNCED Live Photo stills for motion backup under `mode`.
+
+        Only stills whose motion is not already complete under `mode` are
+        queued. The still's own row (its Google item, hash, albums) is not
+        touched -- reprocessing adds the missing motion item, it never
+        replaces, re-uploads or deletes what is already there. Returns how
+        many were queued.
+        """
+        now = self._clock.now().isoformat()
+        params: list[object] = [AssetState.SYNCED.value]
+        where = "a.state = ? AND a.live_photo_video_id IS NOT NULL"
+        if still_ids is not None:
+            if not still_ids:
+                return 0
+            where += f" AND a.immich_id IN ({', '.join('?' for _ in still_ids)})"
+            params.extend(still_ids)
+        with self._conn.lock:
+            rows = self._conn.execute(
+                f"SELECT a.immich_id, a.live_photo_video_id, l.mode, l.status FROM asset a"
+                f" LEFT JOIN live_photo l ON l.still_id = a.immich_id WHERE {where}",
+                params,
+            ).fetchall()
+            queued = 0
+            for row in rows:
+                if row["mode"] == mode and row["status"] == "complete":
+                    continue
+                self._conn.execute(
+                    "INSERT INTO live_photo (still_id, video_id, mode, status, reason, attempts,"
+                    " next_attempt_at, updated_at) VALUES (?, ?, ?, 'pending', 'reprocess_requested', 0,"
+                    " NULL, ?) ON CONFLICT(still_id) DO UPDATE SET mode = excluded.mode,"
+                    " status = excluded.status, reason = excluded.reason, attempts = 0,"
+                    " next_attempt_at = NULL, updated_at = excluded.updated_at",
+                    (row["immich_id"], row["live_photo_video_id"], mode, now),
+                )
+                queued += 1
+        return queued
+
+    def mark_companion_synced(
+        self, immich_id: str, media_key: str, outcome: Outcome, upload_sha1: str
+    ) -> bool:
+        """Record a Live Photo's original .MOV as backed up as its own item.
+
+        Compare-and-set: only a companion still parked as hidden/paired (or
+        already SYNCED to this very item) is updated, so this can never
+        clobber a row some other path is processing.
+        """
+        with self._conn.lock:
+            cur = self._conn.execute(
+                "UPDATE asset SET state = ?, outcome = ?, media_key = ?, upload_sha1 = ?, synced_at = ?,"
+                " ineligible_reason = NULL, error_class = NULL, last_error = NULL, claimed_at = NULL"
+                " WHERE immich_id = ? AND ("
+                "  (state = ? AND ineligible_reason IN ('hidden', 'live_photo_paired'))"
+                "  OR (state = ? AND media_key = ?))",
+                (
+                    AssetState.SYNCED.value,
+                    outcome.value,
+                    media_key,
+                    upload_sha1,
+                    self._clock.now().isoformat(),
+                    immich_id,
+                    AssetState.INELIGIBLE.value,
+                    AssetState.SYNCED.value,
+                    media_key,
+                ),
+            )
+            return cur.rowcount > 0
+
+    def mark_companion_paired(self, immich_id: str, reason: str) -> bool:
+        """Mark a Live Photo companion as folded into a Motion Photo.
+
+        Never touches a companion that is SYNCED as its own Google item (an
+        `original_pair` backup): its mapping is what deletion and dedup key
+        on, and must not be erased by a later derived upload.
+        """
+        with self._conn.lock:
+            cur = self._conn.execute(
+                "UPDATE asset SET state = ?, ineligible_reason = ?, claimed_at = NULL"
+                " WHERE immich_id = ? AND state != ?",
+                (AssetState.INELIGIBLE.value, reason, immich_id, AssetState.SYNCED.value),
+            )
+            return cur.rowcount > 0
+
+    def remove_sync_note(self, immich_id: str, code: str) -> None:
+        with self._conn.lock:
+            row = self._conn.execute(
+                "SELECT sync_notes FROM asset WHERE immich_id = ?", (immich_id,)
+            ).fetchone()
+            if row is None or not row["sync_notes"]:
+                return
+            remaining = [c for c in row["sync_notes"].split(",") if c and c != code]
+            self._conn.execute(
+                "UPDATE asset SET sync_notes = ? WHERE immich_id = ?",
+                (",".join(remaining) or None, immich_id),
+            )
+
     def rows_for_media_key(self, media_key: str) -> list[StoredAsset]:
         """Every row, in any state, that maps onto one Google item."""
         with self._conn.lock:

@@ -80,7 +80,9 @@ def _rig(tmp_path):
     immich = FakeImmichClient(contents={"still-1": STILL_BYTES, "mov-1": VIDEO_BYTES})
     gphotos = FakeGooglePhotosClient()
     resolver = ByteResolver(immich, scratch=tmp_path / "scratch", direct_roots=[tmp_path], assets=assets)
-    worker = Worker(assets, gphotos, resolver, Filters(), RetryPolicy(jitter=0.0), clock)
+    worker = Worker(
+        assets, gphotos, resolver, Filters(), RetryPolicy(jitter=0.0), clock, live_photo_mode="derived_motion"
+    )
     return worker, assets, immich, gphotos
 
 
@@ -100,7 +102,7 @@ def test_resolve_muxes_the_pair_into_one_motion_photo(tmp_path):
         allow_direct=False,
         assets=assets,
     )
-    resolved = resolver.resolve(STILL)
+    resolved = resolver.resolve(STILL, mux_live_photo=True)
 
     assert resolved.temporary is True
     assert resolved.paired_video_id == "mov-1"
@@ -129,12 +131,27 @@ def test_worker_uploads_one_muxed_file_and_pairs_the_clip(tmp_path):
 
 
 def test_missing_companion_falls_back_to_the_still_alone(tmp_path):
+    """derived_motion waits a bounded number of times for the companion row,
+    then backs the still up alone and records the motion as deferred."""
+    from immich_gphotos.sync.worker import MAX_LIVE_PHOTO_DEFERS
+
     worker, assets, _, gphotos = _rig(tmp_path)
     assets.upsert_pending(STILL, Priority.WEBHOOK)
+    for _ in range(MAX_LIVE_PHOTO_DEFERS):
+        with assets._conn.lock:
+            assets._conn.execute("UPDATE asset SET next_attempt_at = NULL")
+        result = worker.process(assets.claim_next(limit=1)[0])
+        assert result.deferred is True
+        assert gphotos.uploads == []
+    with assets._conn.lock:
+        assets._conn.execute("UPDATE asset SET next_attempt_at = NULL")
     result = worker.process(assets.claim_next(limit=1)[0])
 
     assert result.state is AssetState.SYNCED
     assert gphotos.uploads == [(_still_hash(), "IMG_1.JPG")]
+    live = assets.live_photo("still-1")
+    assert live["status"] == "deferred"
+    assert live["reason"] == "companion_missing"
 
 
 def test_heic_still_falls_back_without_pairing(tmp_path):
@@ -144,7 +161,9 @@ def test_heic_still_falls_back_without_pairing(tmp_path):
     immich = FakeImmichClient(contents={"still-1": heic, "mov-1": VIDEO_BYTES})
     gphotos = FakeGooglePhotosClient()
     resolver = ByteResolver(immich, scratch=tmp_path / "scratch", direct_roots=[tmp_path], assets=assets)
-    worker = Worker(assets, gphotos, resolver, Filters(), RetryPolicy(jitter=0.0), clock)
+    worker = Worker(
+        assets, gphotos, resolver, Filters(), RetryPolicy(jitter=0.0), clock, live_photo_mode="derived_motion"
+    )
     _enqueue(assets)
 
     result = worker.process(assets.claim_next(limit=1)[0])
@@ -173,7 +192,9 @@ def test_heic_pair_is_muxed_via_exiftool_and_paired_on_upload(tmp_path):
     resolver = ByteResolver(
         immich, scratch=tmp_path / "scratch", direct_roots=[tmp_path], assets=assets, xmp=fake
     )
-    worker = Worker(assets, gphotos, resolver, Filters(), RetryPolicy(jitter=0.0), clock)
+    worker = Worker(
+        assets, gphotos, resolver, Filters(), RetryPolicy(jitter=0.0), clock, live_photo_mode="derived_motion"
+    )
     assets.upsert_pending(heic_still, Priority.WEBHOOK)
     assets.upsert_pending(MOV, Priority.WEBHOOK)
 
@@ -208,7 +229,15 @@ def test_heic_falls_back_when_exiftool_is_missing_or_refuses(tmp_path):
         resolver = ByteResolver(
             immich, scratch=tmp_path / "scratch", direct_roots=[tmp_path], assets=assets, xmp=xmp
         )
-        worker = Worker(assets, gphotos, resolver, Filters(), RetryPolicy(jitter=0.0), clock)
+        worker = Worker(
+            assets,
+            gphotos,
+            resolver,
+            Filters(),
+            RetryPolicy(jitter=0.0),
+            clock,
+            live_photo_mode="derived_motion",
+        )
         assets.upsert_pending(
             replace(STILL, filename="IMG_1.HEIC", live_photo_video_id="mov-1"), Priority.WEBHOOK
         )
@@ -246,10 +275,47 @@ def test_direct_read_pair_is_muxed_without_touching_originals(tmp_path):
     assets.upsert_pending(replace(STILL, original_path=str(still_path)), Priority.WEBHOOK)
     assets.upsert_pending(replace(MOV, original_path=str(mov_path)), Priority.WEBHOOK)
 
-    resolved = resolver.resolve(replace(STILL, original_path=str(still_path)))
+    resolved = resolver.resolve(replace(STILL, original_path=str(still_path)), mux_live_photo=True)
 
     assert resolved.paired_video_id == "mov-1"
     assert resolved.path.read_bytes().endswith(VIDEO_BYTES)
     assert still_path.read_bytes() == STILL_BYTES  # untouched
     assert mov_path.read_bytes() == VIDEO_BYTES  # untouched
     resolver.release(resolved)
+
+
+def test_avif_pair_is_muxed_with_an_avif_primary_item(tmp_path):
+    from immich_gphotos.sync import livephoto
+    from immich_gphotos.sync.exif_xmp import FakeMotionPhotoXmp
+
+    avif_bytes = (Path(__file__).with_name("fixtures") / "small.avif").read_bytes()
+    assert livephoto.isobmff_image_kind(avif_bytes) == "avif"
+    fake = FakeMotionPhotoXmp(keyframe_us=None)
+    expected = avif_bytes + livephoto.heic_trailer(VIDEO_BYTES, len(avif_bytes))
+
+    still = replace(STILL, immich_id="still-1", filename="IMG_1.AVIF", live_photo_video_id="mov-1")
+    clock = FakeClock()
+    assets = AssetRepo(connect(tmp_path / "t.db"), clock)
+    immich = FakeImmichClient(contents={"still-1": avif_bytes, "mov-1": VIDEO_BYTES})
+    gphotos = FakeGooglePhotosClient()
+    resolver = ByteResolver(
+        immich, scratch=tmp_path / "scratch", direct_roots=[tmp_path], assets=assets, xmp=fake
+    )
+    worker = Worker(
+        assets, gphotos, resolver, Filters(), RetryPolicy(jitter=0.0), clock, live_photo_mode="derived_motion"
+    )
+    assets.upsert_pending(still, Priority.WEBHOOK)
+    assets.upsert_pending(MOV, Priority.WEBHOOK)
+
+    result = worker.process(assets.claim_next(limit=1)[0])
+
+    assert result.state is AssetState.SYNCED
+    assert gphotos.uploads == [(_sha1_b64(expected), "IMG_1.AVIF")]
+    packet = fake.writes[0][1].decode()
+    assert 'Item:Mime="image/avif"' in packet
+    row = assets.live_photo("still-1")
+    assert (row["status"], row["still_sha1"], row["derived_sha1"]) == (
+        "complete",
+        _sha1_b64(avif_bytes),
+        _sha1_b64(expected),
+    )

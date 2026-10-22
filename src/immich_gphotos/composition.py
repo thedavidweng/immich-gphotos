@@ -40,6 +40,7 @@ from immich_gphotos.sync.bytes import ByteResolver
 from immich_gphotos.sync.deletions import DeletionSweeper
 from immich_gphotos.sync.exif_xmp import ExifToolMotionPhotoXmp
 from immich_gphotos.sync.favorites import FavoriteSyncer
+from immich_gphotos.sync.livephoto_backup import LivePhotoCompleter
 from immich_gphotos.sync.loops import BackgroundLoops
 from immich_gphotos.sync.reconciler import Reconciler
 from immich_gphotos.sync.runtime import Runtime
@@ -138,6 +139,7 @@ def build_runtime_graph(
         xmp=ExifToolMotionPhotoXmp.if_available(),
     )
     favorite_syncer = FavoriteSyncer(gphotos, assets)
+    live_photos = LivePhotoCompleter(assets, gphotos, resolver, clock, settings.live_photo_mode)
     worker = Worker(
         assets,
         gphotos,
@@ -149,6 +151,8 @@ def build_runtime_graph(
         gate=gate,
         favorites_enabled=settings.favorites_enabled,
         favorites=favorite_syncer,
+        live_photo_mode=settings.live_photo_mode,
+        live_photos=live_photos,
     )
     runtime = Runtime(assets, worker, settings, clock, events, immich=immich)
     backfill = BackfillJob(immich, assets, cursors, settings)
@@ -163,6 +167,7 @@ def build_runtime_graph(
         events=events,
         assets=assets,
         favorite_syncer=favorite_syncer,
+        live_photo_completer=live_photos,
     )
     return runtime, backfill, loops
 

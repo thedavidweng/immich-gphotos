@@ -34,8 +34,12 @@ The old `GCamera:MicroVideo` attributes are deliberately not written:
 deleted in 1.0, readers must ignore them.
 """
 
+import base64
+import hashlib
+import os
 import struct
 import xml.etree.ElementTree as ET
+from pathlib import Path
 
 # Set when the companion `.MOV` was folded into its still's upload, so the
 # hidden clip is accounted for instead of sitting in `ineligible: hidden`
@@ -55,6 +59,40 @@ _RDF_NS = "http://www.w3.org/1999/02/22-rdf-syntax-ns#"
 # bloat scratch and the upload for no motion-photo benefit.
 MAX_VIDEO_BYTES = 64 * 1024 * 1024
 
+# Cap the still we will mux. Real Live Photo stills are a few MB; this only
+# exists so a mislabelled multi-gigabyte file is refused by a stat() before
+# anything is read, rather than streamed into scratch for nothing.
+MAX_STILL_BYTES = 256 * 1024 * 1024
+
+# Muxing streams in chunks of this size, so memory per worker thread is
+# bounded by a constant rather than by the size of the media it handles.
+_CHUNK = 1024 * 1024
+
+# Live Photo backup strategies (`Settings.live_photo_mode`).
+#   still_only_legacy  upload the still unchanged and skip the hidden .MOV --
+#                      the upstream behaviour, and the default so an upgrade
+#                      never changes what an existing account uploads. The
+#                      motion is recorded as *not* backed up.
+#   original_pair      back up the original still and the original .MOV as
+#                      two separate Google items, each under the SHA-1 of its
+#                      own unmodified bytes. Google shows them as two items;
+#                      it is not a native linked Live Photo.
+#   derived_motion     (explicit opt-in) build a Google Motion Photo from the
+#                      two originals in scratch and upload that derived file;
+#                      the originals are never modified.
+LIVE_PHOTO_MODES = ("still_only_legacy", "original_pair", "derived_motion")
+DEFAULT_LIVE_PHOTO_MODE = "still_only_legacy"
+
+# Per-Live-Photo completeness (`live_photo.status`).
+STATUS_NOT_CONFIGURED = "not_configured"  # mode does not back the motion up
+STATUS_PENDING = "pending"  # motion still to be backed up under this mode
+STATUS_COMPLETE = "complete"  # motion verifiably backed up (MOV item or Motion Photo)
+STATUS_FAILED = "failed"  # a permanent reason; only an explicit reprocess retries
+STATUS_DEFERRED = "deferred"  # gave up for now (or original already present); reprocess retries
+
+# Sync note on a still whose motion is not in Google (see bytes.TIMESTAMP_UNVERIFIED).
+MOTION_NOT_BACKED_UP = "motion_not_backed_up"
+
 
 def is_jpeg(data: bytes) -> bool:
     """True when `data` starts with the JPEG SOI marker."""
@@ -71,6 +109,123 @@ def looks_like_video(data: bytes) -> bool:
     """
     head = data[:32]
     return any(tag in head for tag in (b"ftyp", b"moov", b"mdat", b"free", b"wide"))
+
+
+def _sha1_b64(digest: "hashlib._Hash") -> str:
+    return base64.b64encode(digest.digest()).decode("ascii")
+
+
+def _read_head(path: Path, n: int = 4096) -> bytes:
+    with path.open("rb") as handle:
+        return handle.read(n)
+
+
+def check_video_file(path: Path) -> int:
+    """Reject a companion clip that must not be muxed, by stat + header only.
+
+    Returns its size. Raises ValueError (permanent: muxing would never work)
+    or OSError (unreadable right now). Never reads the whole clip.
+    """
+    size = path.stat().st_size
+    if size == 0:
+        raise ValueError("companion video is empty")
+    if size > MAX_VIDEO_BYTES:
+        raise ValueError(f"companion video too large: {size} bytes")
+    if not looks_like_video(_read_head(path, 32)):
+        raise ValueError("companion bytes do not look like MP4/MOV")
+    return size
+
+
+def check_still_file(path: Path) -> int:
+    size = path.stat().st_size
+    if size == 0:
+        raise ValueError("still is empty")
+    if size > MAX_STILL_BYTES:
+        raise ValueError(f"still too large to mux: {size} bytes")
+    return size
+
+
+def still_kind(path: Path) -> str | None:
+    """ "jpeg", "heic", "avif" or None, from the first few KiB only."""
+    head = _read_head(path)
+    if is_jpeg(head):
+        return "jpeg"
+    return isobmff_image_kind(head)
+
+
+def _copy_into(dest, path: Path, digest, skip: int = 0) -> None:  # noqa: ANN001 - file + hashlib
+    with path.open("rb") as src:
+        if skip:
+            src.seek(skip)
+        for chunk in iter(lambda: src.read(_CHUNK), b""):
+            dest.write(chunk)
+            digest.update(chunk)
+
+
+def sha1_b64_of_file(path: Path) -> str:
+    digest = hashlib.sha1()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(_CHUNK), b""):
+            digest.update(chunk)
+    return _sha1_b64(digest)
+
+
+def _jpeg_has_eoi(path: Path) -> bool:
+    tail = b""
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(_CHUNK), b""):
+            if b"\xff\xd9" in tail + chunk:
+                return True
+            tail = chunk[-1:]
+    return False
+
+
+def write_motion_photo_jpeg(still: Path, video: Path, dest: Path, video_mime: str) -> str:
+    """Stream-build a JPEG Motion Photo at `dest`; returns its base64 SHA-1.
+
+    Same bytes as `build_motion_photo_jpeg(still.read_bytes(), ...)`, but in
+    bounded memory: stat + header checks first, then the still and video are
+    copied through in chunks. Raises ValueError for anything that must fall
+    back to still-only, OSError when a source is unreadable; `dest` is
+    removed on any failure (it is only ever a scratch path).
+    """
+    check_still_file(still)
+    if not is_jpeg(_read_head(still, 2)):
+        raise ValueError("still is not a JPEG")
+    video_size = check_video_file(video)
+    if not _jpeg_has_eoi(still):
+        raise ValueError("still JPEG has no EOI marker")
+    segment = _app1_segment(_xmp_packet(video_size, video_mime))
+    digest = hashlib.sha1()
+    try:
+        with dest.open("wb") as out:
+            head = _JPEG_SOI + segment
+            out.write(head)
+            digest.update(head)
+            _copy_into(out, still, digest, skip=2)
+            _copy_into(out, video, digest)
+        if os.stat(video).st_size != video_size:
+            raise OSError("companion video changed while muxing")
+    except BaseException:
+        dest.unlink(missing_ok=True)
+        raise
+    return _sha1_b64(digest)
+
+
+def append_heic_trailer(dest: Path, video: Path, video_size: int) -> None:
+    """Append the mpvd/sefd trailer to an XMP-stamped HEIC at `dest`, streaming the video."""
+    image_size = dest.stat().st_size
+    prefix, suffix = heic_trailer_parts(video_size, image_size)
+    with dest.open("ab") as out:
+        out.write(prefix)
+        with video.open("rb") as src:
+            copied = 0
+            for chunk in iter(lambda: src.read(_CHUNK), b""):
+                out.write(chunk)
+                copied += len(chunk)
+        if copied != video_size:
+            raise OSError("companion video changed while muxing")
+        out.write(suffix)
 
 
 def check_video_bytes(video_bytes: bytes) -> None:
@@ -329,6 +484,41 @@ def merge_xmp(original: str | None, ours: bytes) -> bytes:
     for prefix, uri in _HEIC_XMP_NAMESPACES.items():
         ET.register_namespace(prefix, uri)
     return ET.tostring(ours_root, encoding="utf-8")
+
+
+def heic_trailer_parts(video_length: int, image_size: int) -> tuple[bytes, bytes]:
+    """`heic_trailer` split around the video: (bytes before it, bytes after it).
+
+    Lets the trailer be written with the clip streamed in between, so it is
+    never held in memory. `prefix + video + suffix == heic_trailer(video, image_size)`.
+    """
+    mpv2 = b"mpv2" + struct.pack(">i", image_size + _BOX_HEADER_LEN) + struct.pack(">i", video_length)
+    tags = {"MotionPhoto_Data": mpv2, "MotionPhoto_Version": b"mpv3"}
+    tag_data = b""
+    tag_offsets: dict[str, int] = {}
+    tag_lengths: dict[str, int] = {}
+    for name, tag_id in _SAMSUNG_TAG_ORDER:
+        field = tag_id + struct.pack("<i", len(name)) + name.encode("utf-8") + tags[name]
+        tag_data += field
+        tag_lengths[name] = len(field)
+        for preceding, _ in _SAMSUNG_TAG_ORDER:
+            tag_offsets[preceding] = len(field) + (tag_offsets.get(preceding) or 0)
+            if preceding == name:
+                break
+    sefh = b"SEFH" + struct.pack("<i", _SAMSUNG_SEFH_VERSION) + struct.pack("<i", len(tags))
+    for name, tag_id in _SAMSUNG_TAG_ORDER:
+        sefh += tag_id + struct.pack("<i", tag_offsets[name]) + struct.pack("<i", tag_lengths[name])
+    sefh_len = len(sefh)
+    sefh += struct.pack("<i", sefh_len) + b"SEFT"
+    suffix = struct.pack(">i", len(tag_data) + len(sefh) + _BOX_HEADER_LEN) + _SEFD_BOX + tag_data + sefh
+    total = _BOX_HEADER_LEN + video_length + len(suffix)
+    return struct.pack(">i", total) + _MPVD_BOX, suffix
+
+
+def heic_trailer_length_for(video_length: int) -> int:
+    """`heic_trailer_length` from the clip's size alone (no bytes needed)."""
+    prefix, suffix = heic_trailer_parts(video_length, 0)
+    return len(prefix) + video_length + len(suffix) - _BOX_HEADER_LEN
 
 
 def heic_trailer(video_bytes: bytes, image_size: int) -> bytes:

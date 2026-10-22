@@ -34,6 +34,7 @@ class BackgroundLoops:
         events: EventRepo,
         assets=None,  # noqa: ANN001 - AssetRepo; only needed for the periodic stale-upload sweep
         favorite_syncer=None,  # noqa: ANN001 - sync.favorites.FavoriteSyncer; None keeps old call sites working
+        live_photo_completer=None,  # noqa: ANN001 - sync.livephoto_backup.LivePhotoCompleter
     ) -> None:
         self._runtime = runtime
         self._reconciler = reconciler
@@ -45,6 +46,7 @@ class BackgroundLoops:
         self._events = events
         self._assets = assets
         self._favorite_syncer = favorite_syncer
+        self._live_photo_completer = live_photo_completer
         self._next_reconcile: datetime | None = None
         self._paused_at: datetime | None = None
 
@@ -96,6 +98,13 @@ class BackgroundLoops:
 
             if self._settings.favorites_enabled and self._favorite_syncer is not None:
                 self._safely("favorite sync", self._favorite_syncer.sync_once)
+
+            # Only does anything outside still_only_legacy, and only for
+            # Live Photos queued under the current mode (see
+            # sync.livephoto_backup) -- never for history the user did not
+            # ask to reprocess.
+            if self._live_photo_completer is not None:
+                self._safely("live photo motion", self._live_photo_completer.sweep)
 
         if self._backfill.is_running():
             self._safely("backfill", self._backfill.run_slice)

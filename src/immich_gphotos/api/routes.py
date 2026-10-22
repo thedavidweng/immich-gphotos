@@ -9,6 +9,7 @@ from immich_gphotos.config import (
     MAX_WORKER_THREADS,
     MIN_BANDWIDTH_BYTES_PER_SECOND,
     MIN_WORKER_THREADS,
+    LivePhotoMode,
     Quality,
 )
 from immich_gphotos.services import Services
@@ -49,6 +50,7 @@ class SettingsPatch(BaseModel):
     albums_enabled: bool | None = None
     deletions_enabled: bool | None = None
     favorites_enabled: bool | None = None
+    live_photo_mode: LivePhotoMode | None = None
     confirm_deletions: str | None = None
     worker_threads: int | None = Field(default=None, ge=MIN_WORKER_THREADS, le=MAX_WORKER_THREADS)
     bandwidth_bytes_per_second: int | None = Field(default=None, ge=MIN_BANDWIDTH_BYTES_PER_SECOND)
@@ -169,6 +171,50 @@ def retry_all(request: Request) -> dict:
     return {"requeued": count}
 
 
+# Reprocessing every Live Photo still adds a Google item per still (the
+# companion .MOV, or a derived Motion Photo next to the existing still), so
+# the bulk form needs this phrase echoed back, like enabling deletions.
+LIVE_PHOTO_REPROCESS_PHRASE = "REPROCESS LIVE PHOTOS"
+
+
+class LivePhotoReprocess(BaseModel):
+    still_ids: list[str] | None = None
+    confirm: str | None = None
+
+
+@router.get("/live-photos")
+def live_photos(request: Request) -> dict:
+    """Read-only plan: how every Live Photo's motion stands, and what a
+    reprocess under the current mode would cover. Changes nothing."""
+    services: Services = request.state.services
+    summary = services.assets.live_photo_summary()
+    return {"mode": services.settings.live_photo_mode, **summary}
+
+
+@router.post("/live-photos/reprocess")
+def reprocess_live_photos(body: LivePhotoReprocess, request: Request) -> dict:
+    """Explicitly queue SYNCED Live Photo stills for motion backup under the
+    current mode. Never deletes, replaces or re-uploads the still itself --
+    it only adds the missing motion item, on the next background sweep."""
+    services: Services = request.state.services
+    mode = services.settings.live_photo_mode
+    if mode == "still_only_legacy":
+        raise HTTPException(
+            status_code=409, detail="choose original_pair or derived_motion before reprocessing Live Photos"
+        )
+    if body.still_ids is None and body.confirm != LIVE_PHOTO_REPROCESS_PHRASE:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "reprocessing every Live Photo requires confirm to be exactly "
+                f'"{LIVE_PHOTO_REPROCESS_PHRASE}"'
+            ),
+        )
+    queued = services.assets.request_live_photo_reprocess(mode, body.still_ids)
+    services.events.add("info", f"Live Photo reprocess: {queued} still(s) queued under {mode}")
+    return {"queued": queued, "mode": mode}
+
+
 def _settings_view(services: Services) -> dict:
     """The one true shape of "settings" as reported to a client: read off the
     live `Settings`, which already carries both the account half (quality,
@@ -183,6 +229,7 @@ def _settings_view(services: Services) -> dict:
         "albums_enabled": services.settings.albums_enabled,
         "deletions_enabled": services.settings.deletions_enabled,
         "favorites_enabled": services.settings.favorites_enabled,
+        "live_photo_mode": services.settings.live_photo_mode,
         "worker_threads": services.settings.worker_threads,
         "bandwidth_bytes_per_second": services.settings.bandwidth_bytes_per_second,
     }

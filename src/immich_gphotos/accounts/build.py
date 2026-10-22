@@ -27,6 +27,7 @@ from immich_gphotos.config import (
     MAX_WORKER_THREADS,
     MIN_BANDWIDTH_BYTES_PER_SECOND,
     MIN_WORKER_THREADS,
+    LivePhotoMode,
     Quality,
     Settings,
 )
@@ -55,6 +56,7 @@ from immich_gphotos.sync.loops import STALE_UPLOAD_AGE, LoopsHandle
 from immich_gphotos.sync.throttle import TokenBucket
 
 _QUALITIES = frozenset(get_args(Quality))
+_LIVE_PHOTO_MODES = frozenset(get_args(LivePhotoMode))
 
 # Every key the "settings" row can carry, account-scoped or global. Shared by
 # both halves of `_merged_settings` below so the two loops that walk `stored`
@@ -66,6 +68,7 @@ _SETTINGS_KEYS = (
     "albums_enabled",
     "deletions_enabled",
     "favorites_enabled",
+    "live_photo_mode",
     "worker_threads",
     "bandwidth_bytes_per_second",
 )
@@ -84,6 +87,8 @@ def _validated(key: str, value: object) -> object | None:
     """
     if key == "quality":
         return value if isinstance(value, str) and value in _QUALITIES else None
+    if key == "live_photo_mode":
+        return value if isinstance(value, str) and value in _LIVE_PHOTO_MODES else None
     if key in ("albums_enabled", "deletions_enabled", "favorites_enabled"):
         return value if isinstance(value, bool) else None
     if key == "worker_threads":

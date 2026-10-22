@@ -91,13 +91,15 @@ def test_real_exiftool_full_heic_mux_flow(tmp_path):
     resolver = ByteResolver(
         immich, scratch=tmp_path / "scratch", direct_roots=[tmp_path], assets=assets, xmp=xmp
     )
-    worker = Worker(assets, gphotos, resolver, Filters(), RetryPolicy(jitter=0.0), clock)
+    worker = Worker(
+        assets, gphotos, resolver, Filters(), RetryPolicy(jitter=0.0), clock, live_photo_mode="derived_motion"
+    )
     assets.upsert_pending(still, Priority.WEBHOOK)
     assets.upsert_pending(mov, Priority.WEBHOOK)
 
     # Content proof on the muxed bytes themselves, before the upload path
     # cleans up scratch: ExifTool-embedded XMP reads back, trailer present.
-    resolved = resolver.resolve(still)
+    resolved = resolver.resolve(still, mux_live_photo=True)
     try:
         data = resolved.path.read_bytes()
         # Trailer layout: mpvd{ video + sefd{ tags + SEFH..SEFT } } at the end
@@ -114,3 +116,63 @@ def test_real_exiftool_full_heic_mux_flow(tmp_path):
     assert result.state is AssetState.SYNCED
     assert len(gphotos.uploads) == 1
     assert assets.get("mov-1").ineligible_reason == "live_photo_paired"
+
+
+def test_real_exiftool_avif_mux_keeps_the_original_untouched(tmp_path):
+    """AVIF still (checked-in Pillow-generated fixture) through the real
+    ExifTool writer, read directly from a library root: the derived file
+    carries the Motion Photo XMP and trailer, the original is byte-identical
+    and keeps its mtime."""
+    import os
+
+    library = tmp_path / "library"
+    library.mkdir()
+    avif = library / "IMG_2.AVIF"
+    avif.write_bytes((Path(__file__).with_name("fixtures") / "small.avif").read_bytes())
+    clip = library / "IMG_2.MOV"
+    clip.write_bytes(VIDEO)
+    before = (avif.read_bytes(), avif.stat().st_mtime_ns)
+    still = Asset(
+        immich_id="still-2",
+        checksum="sum-avif",
+        filename="IMG_2.AVIF",
+        type="IMAGE",
+        size_bytes=len(before[0]),
+        immich_updated_at="2026-09-17T10:00:00Z",
+        taken_at=None,
+        live_photo_video_id="mov-2",
+        original_path=str(avif),
+        visibility="timeline",
+        is_offline=False,
+        is_trashed=False,
+    )
+    mov = replace(
+        still,
+        immich_id="mov-2",
+        checksum="sum-mov2",
+        filename="IMG_2.MOV",
+        type="VIDEO",
+        live_photo_video_id=None,
+        original_path=str(clip),
+        visibility="hidden",
+    )
+    assets = AssetRepo(connect(tmp_path / "t.db"), FakeClock())
+    assets.upsert_pending(mov, Priority.WEBHOOK)
+    xmp = ExifToolMotionPhotoXmp()
+    resolver = ByteResolver(
+        FakeImmichClient(), scratch=tmp_path / "scratch", direct_roots=[library], assets=assets, xmp=xmp
+    )
+    resolved = resolver.resolve(still, mux_live_photo=True)
+    try:
+        assert resolved.derived is True
+        packet = xmp.original_xmp(resolved.path) or ""
+        assert "Camera:MotionPhoto" in packet
+        assert 'Item:Mime="image/avif"' in packet
+        data = resolved.path.read_bytes()
+        assert data.endswith(b"SEFT")
+        found = xmp._helper.get_tags([str(resolved.path)], ["FileType"])
+        assert found[0].get("File:FileType") == "AVIF"
+    finally:
+        resolver.release(resolved)
+    assert (avif.read_bytes(), avif.stat().st_mtime_ns) == before
+    assert sorted(os.listdir(library)) == ["IMG_2.AVIF", "IMG_2.MOV"]

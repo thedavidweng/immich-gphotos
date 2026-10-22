@@ -83,6 +83,39 @@ CREATE TABLE IF NOT EXISTS favorite_remote (
   evaluated_at TEXT
 );
 
+-- One row per Apple Live Photo still this service has handled: whether its
+-- motion is backed up, under which `live_photo_mode`, and the separate
+-- identities involved. The still's own asset row keeps describing whatever
+-- was uploaded *for the still* (media_key / upload_sha1); this table keeps
+-- the companion and derived identities apart from it:
+--   still_sha1          content SHA-1 of the original still's bytes
+--   video_sha1 / video_media_key      the original .MOV backed up as its own
+--                       item (original_pair)
+--   derived_sha1 / derived_media_key  the Motion Photo built in scratch from
+--                       both originals (derived_motion) -- never inferred
+--                       from the still's hash
+--   status              not_configured | pending | complete | failed | deferred
+--                       (see sync.livephoto); `complete` only once the motion
+--                       is verifiably in Google, never for a still-only upload
+--   reason              why it is not complete (companion_missing, rejected:...)
+--   attempts / next_attempt_at        retry bookkeeping for `pending`
+CREATE TABLE IF NOT EXISTS live_photo (
+  still_id          TEXT PRIMARY KEY,
+  video_id          TEXT NOT NULL,
+  mode              TEXT NOT NULL,
+  status            TEXT NOT NULL,
+  reason            TEXT,
+  still_sha1        TEXT,
+  video_sha1        TEXT,
+  video_media_key   TEXT,
+  derived_sha1      TEXT,
+  derived_media_key TEXT,
+  attempts          INTEGER NOT NULL DEFAULT 0,
+  next_attempt_at   TEXT,
+  updated_at        TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS live_photo_status ON live_photo(mode, status);
+
 CREATE TABLE IF NOT EXISTS album_map (
   immich_album_id TEXT PRIMARY KEY,
   gp_album_id     TEXT NOT NULL,

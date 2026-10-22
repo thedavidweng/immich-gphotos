@@ -166,6 +166,22 @@ class ResolvedBytes:
     source_identity: tuple[int, int, int, int] | None = None
     # Non-fatal diagnostics about this resolution (e.g. TIMESTAMP_UNVERIFIED).
     notes: tuple[str, ...] = ()
+    # Live Photo bookkeeping, only ever set when `resolve` was asked to mux
+    # (`mux_live_photo=True`, i.e. `derived_motion` mode):
+    #   derived            True when `path` is a Motion Photo built in scratch
+    #                      from the two originals -- a *derived* artifact whose
+    #                      SHA-1 (`sha1_b64`) is not the original still's.
+    #   raw_still_sha1     the original still's own content SHA-1, so the
+    #                      worker can tell "original already in Google" apart
+    #                      from "Motion Photo already in Google".
+    #   live_failure       why muxing did not happen (bytes are the still alone)
+    #   live_failure_transient  whether that reason may clear by itself (the
+    #                      companion row not there yet, a read error) as
+    #                      opposed to never (unsupported format, oversized clip).
+    derived: bool = False
+    raw_still_sha1: str | None = None
+    live_failure: str | None = None
+    live_failure_transient: bool = False
 
 
 def _within(path: Path, root: Path) -> bool:
@@ -326,7 +342,7 @@ class ByteResolver:
         except OSError:
             return False
 
-    def resolve(self, asset: Asset) -> ResolvedBytes:
+    def resolve(self, asset: Asset, *, mux_live_photo: bool = False) -> ResolvedBytes:
         """Resolve `asset`'s bytes and certify their content SHA-1.
 
         The muxed Live Photo branch wins when it can mux; otherwise the
@@ -337,13 +353,24 @@ class ByteResolver:
         rows are sha1(path)), so the worker describes these bytes, never
         Immich's checksum. An unreadable file raises OSError: unhashed bytes
         go nowhere rather than up with a description we could not verify.
+
+        Muxing only ever happens when the caller asks for it
+        (`mux_live_photo`, set by the worker only in `derived_motion` mode):
+        a Live Photo still is otherwise resolved exactly like any other
+        image, its original bytes untouched.
         """
-        resolved: ResolvedBytes | None = None
-        if asset.live_photo_video_id and self._assets is not None:
-            resolved = self._try_resolve_live_photo(asset)
-        if resolved is None:
-            resolved = self._resolve_single(asset)
-        return self._certify(asset, resolved)
+        if mux_live_photo and asset.live_photo_video_id and self._assets is not None:
+            muxed, reason, transient = self._try_resolve_live_photo(asset)
+            if muxed is not None:
+                return muxed
+            single = self._certify(asset, self._resolve_single(asset))
+            return replace(
+                single,
+                raw_still_sha1=single.sha1_b64,
+                live_failure=reason,
+                live_failure_transient=transient,
+            )
+        return self._certify(asset, self._resolve_single(asset))
 
     def _certify(self, asset: Asset, resolved: ResolvedBytes) -> ResolvedBytes:
         """Attach the content SHA-1, re-resolving through the API if a direct
@@ -374,14 +401,21 @@ class ByteResolver:
         nonce = uuid.uuid4().hex
         return self._scratch / f"{asset.immich_id}-{nonce}-{Path(asset.filename).name}"
 
-    def _try_resolve_live_photo(self, still: Asset) -> ResolvedBytes | None:
-        """Mux a Live Photo still with its companion motion, or None.
+    def _try_resolve_live_photo(self, still: Asset) -> tuple[ResolvedBytes | None, str | None, bool]:
+        """Build a Motion Photo from a Live Photo still and its companion.
 
-        None means "upload the still alone": the companion row is missing,
-        either side's bytes cannot be read, the still is neither a JPEG nor
-        a HEIC/AVIF still, ExifTool is unavailable or refuses the write, or
-        the video is empty/oversized/unrecognised. Every such case logs at
-        debug and falls back -- never raises out of `resolve`.
+        Returns (muxed, None, False) on success, else (None, reason,
+        transient): `transient` reasons (companion row not in the database
+        yet, a source unreadable right now, an I/O error mid-mux) may clear
+        by themselves; the rest (unsupported still format, rejected clip,
+        ExifTool missing or refusing) will not without a change on the
+        user's side. Never raises out of `resolve`.
+
+        Memory is bounded: sizes and headers are checked by stat and a short
+        read before anything else, and both sources are streamed through in
+        chunks into a fresh scratch file. Only scratch copies are ever
+        written -- the originals (direct-read or downloaded) are read-only
+        inputs here -- and a failed mux removes its own scratch file.
         """
         from immich_gphotos.sync import livephoto
 
@@ -390,54 +424,72 @@ class ByteResolver:
             companion_stored = self._assets.get(still.live_photo_video_id or "")
         except Exception as exc:  # noqa: BLE001 - a lookup failure costs motion, not the backup
             logger.debug("could not look up Live Photo motion for %s: %s", still.immich_id, exc)
-            return None
+            return None, "companion_lookup_failed", True
         if companion_stored is None:
-            return None
+            return None, "companion_missing", True
         companion = companion_stored.asset
         try:
             still_single = self._resolve_single(still)
         except Exception as exc:  # noqa: BLE001 - motion is never worth failing the still over
             logger.debug("could not resolve Live Photo still %s: %s", still.immich_id, exc)
-            return None
+            return None, "still_unreadable", True
         try:
             companion_single = self._resolve_single(companion)
         except Exception as exc:  # noqa: BLE001 - see above
             logger.debug("could not resolve Live Photo motion for %s: %s", still.immich_id, exc)
             self.release(still_single)
-            return None
+            return None, "companion_unreadable", True
+        muxed_path: Path | None = None
         try:
             try:
-                still_bytes = still_single.path.read_bytes()
-                video_bytes = companion_single.path.read_bytes()
+                kind = livephoto.still_kind(still_single.path)
+                raw_still_sha1 = livephoto.sha1_b64_of_file(still_single.path)
             except OSError as exc:
-                logger.debug("could not read Live Photo pair for %s: %s", still.immich_id, exc)
-                return None
-            video_mime = livephoto.video_mime_for_filename(companion.filename)
-            if livephoto.is_jpeg(still_bytes):
-                try:
-                    muxed_inline = livephoto.build_motion_photo_jpeg(still_bytes, video_bytes, video_mime)
-                except ValueError as exc:
-                    logger.debug("not muxing Live Photo %s: %s", still.immich_id, exc)
-                    return None
-                muxed_path = self._scratch_path(still)
-                try:
-                    muxed_path.write_bytes(muxed_inline)
-                except OSError as exc:
-                    logger.debug("could not stage muxed Live Photo %s: %s", still.immich_id, exc)
-                    muxed_path.unlink(missing_ok=True)
-                    return None
-            elif (kind := livephoto.isobmff_image_kind(still_bytes)) is not None:
-                muxed_path = self._mux_heic_with_exiftool(
-                    still, still_single.path, companion_single.path, video_bytes, kind, video_mime
-                )
-                if muxed_path is None:
-                    return None
-            else:
+                logger.debug("could not read Live Photo still %s: %s", still.immich_id, exc)
+                return None, "still_unreadable", True
+            if kind is None:
                 logger.debug("not muxing Live Photo %s: still is not JPEG/HEIC/AVIF", still.immich_id)
-                return None
-            _stamp_capture_date(muxed_path, still.taken_at or self._lookup_taken_at(still))
-            return ResolvedBytes(path=muxed_path, temporary=True, paired_video_id=companion.immich_id)
+                return None, "still_format_unsupported", False
+            video_mime = livephoto.video_mime_for_filename(companion.filename)
+            muxed_path = self._scratch_path(still)
+            try:
+                if kind == "jpeg":
+                    livephoto.write_motion_photo_jpeg(
+                        still_single.path, companion_single.path, muxed_path, video_mime
+                    )
+                else:
+                    reason = self._mux_heic_with_exiftool(
+                        still, still_single.path, companion_single.path, muxed_path, kind, video_mime
+                    )
+                    if reason is not None:
+                        muxed_path.unlink(missing_ok=True)
+                        return None, reason, False
+            except ValueError as exc:
+                muxed_path.unlink(missing_ok=True)
+                logger.debug("not muxing Live Photo %s: %s", still.immich_id, exc)
+                return None, f"rejected: {exc}", False
+            except OSError as exc:
+                muxed_path.unlink(missing_ok=True)
+                logger.debug("could not stage muxed Live Photo %s: %s", still.immich_id, exc)
+                return None, "mux_io_error", True
+            notes: tuple[str, ...] = ()
+            if not _stamp_capture_date(muxed_path, still.taken_at or self._lookup_taken_at(still)):
+                notes = (TIMESTAMP_UNVERIFIED,)
+            muxed = ResolvedBytes(
+                path=muxed_path,
+                temporary=True,
+                paired_video_id=companion.immich_id,
+                sha1_b64=_sha1_base64_of_file(muxed_path),
+                notes=notes,
+                derived=True,
+                raw_still_sha1=raw_still_sha1,
+            )
+            muxed_path = None  # handed over; the caller releases it
+            return muxed, None, False
         finally:
+            if muxed_path is not None:
+                # Every failure path: never leave a half-built scratch file.
+                muxed_path.unlink(missing_ok=True)
             # The muxed file is an independent copy; both source files are
             # no longer needed once it is staged (or once we have given up).
             self.release(still_single)
@@ -448,35 +500,32 @@ class ByteResolver:
         still: Asset,
         still_path: Path,
         video_path: Path,
-        video_bytes: bytes,
+        muxed_path: Path,
         kind: str,
         video_mime: str,
-    ) -> Path | None:
-        """Mux a HEIC/AVIF still via ExifTool, or None to fall back.
+    ) -> str | None:
+        """Mux a HEIC/AVIF still via ExifTool into `muxed_path`.
 
-        ExifTool writes the merged Motion Photo XMP into a scratch copy of
-        the still (never Immich's original -- only `muxed_path` is ever
-        passed to `write_xmp`), then the trailer is appended in Python.
-        Every failure -- missing binary, unreadable tags, refused write --
-        costs motion, never the backup.
+        Returns None on success or a permanent failure reason. ExifTool
+        writes the merged Motion Photo XMP into the scratch copy (never the
+        original -- only `muxed_path` is ever passed to `write_xmp`), then
+        the trailer is appended with the clip streamed through. Raises
+        ValueError for a rejected clip/still and OSError for I/O trouble.
         """
         from immich_gphotos.sync import livephoto
 
         if self._xmp is None:
             logger.debug("not muxing Live Photo %s: exiftool is unavailable", still.immich_id)
-            return None
-        try:
-            livephoto.check_video_bytes(video_bytes)
-        except ValueError as exc:
-            logger.debug("not muxing Live Photo %s: %s", still.immich_id, exc)
-            return None
+            return "exiftool_unavailable"
+        livephoto.check_still_file(still_path)
+        video_size = livephoto.check_video_file(video_path)
         try:
             keyframe_us = self._xmp.keyframe_us(video_path)
         except Exception as exc:  # noqa: BLE001 - unknown timestamp degrades to -1
             logger.debug("could not read keyframe for %s: %s", still.immich_id, exc)
             keyframe_us = None
         packet = livephoto.heic_xmp_packet(
-            livephoto.heic_trailer_length(video_bytes),
+            livephoto.heic_trailer_length_for(video_size),
             video_mime,
             livephoto.image_mime_for_kind(kind),
             keyframe_us,
@@ -486,26 +535,14 @@ class ByteResolver:
         except Exception as exc:  # noqa: BLE001 - nothing to merge just means ours alone
             logger.debug("could not read original XMP for %s: %s", still.immich_id, exc)
             original = None
-        muxed_path = self._scratch_path(still)
-        try:
-            shutil.copyfile(still_path, muxed_path)
-        except OSError as exc:
-            logger.debug("could not stage Live Photo still %s: %s", still.immich_id, exc)
-            return None
+        shutil.copyfile(still_path, muxed_path)
         try:
             self._xmp.write_xmp(muxed_path, livephoto.merge_xmp(original, packet))
         except Exception as exc:  # noqa: BLE001 - a refused write costs motion, not the backup
             logger.debug("could not write Motion Photo XMP for %s: %s", still.immich_id, exc)
-            muxed_path.unlink(missing_ok=True)
-            return None
-        try:
-            with muxed_path.open("ab") as handle:
-                handle.write(livephoto.heic_trailer(video_bytes, muxed_path.stat().st_size))
-        except OSError as exc:
-            logger.debug("could not append motion trailer for %s: %s", still.immich_id, exc)
-            muxed_path.unlink(missing_ok=True)
-            return None
-        return muxed_path
+            return "exiftool_refused"
+        livephoto.append_heic_trailer(muxed_path, video_path, video_size)
+        return None
 
     def _resolve_single(self, asset: Asset) -> ResolvedBytes:
         if self._allow_direct and asset.original_path:
