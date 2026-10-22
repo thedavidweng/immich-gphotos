@@ -227,6 +227,8 @@ def build_account_services(
     global_settings: dict | None = None,
     bandwidth: TokenBucket | None = None,
     gate: AbstractContextManager[Any] | None = None,
+    favorite_ledger: Any = None,
+    account_id: str | None = None,
 ) -> tuple[Services, LoopsHandle]:
     """One account's graph. Credentials come from that account's database, never from env.
 
@@ -309,6 +311,8 @@ def build_account_services(
         direct_roots=direct_roots,
         bandwidth=bandwidth,
         gate=gate,
+        favorite_ledger=favorite_ledger,
+        account_id=account_id,
     )
 
     workflow_id = settings_repo.get(WORKFLOW_ID_KEY)
@@ -334,6 +338,8 @@ def build_account_services(
         bandwidth=bandwidth,
         gate=gate,
         conn=conn,
+        favorite_ledger=favorite_ledger,
+        account_id=account_id,
     )
     loops_handle = LoopsHandle(loops)
     services.loops_handle = loops_handle

@@ -63,3 +63,7 @@ class Services:
     # files still open. `None` for a hand-assembled `Services` in tests, which
     # is why `remove` treats it as optional.
     conn: Any = None  # sqlite3.Connection
+    # The process-wide sync.favorite_ledger.SharedFavoriteLedger and this
+    # account's id in it; None for a single hand-built Services in tests.
+    favorite_ledger: Any = None
+    account_id: str | None = None

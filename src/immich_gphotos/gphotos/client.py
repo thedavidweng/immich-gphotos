@@ -145,6 +145,13 @@ class GpmcClient:
         self._local = threading.local()
 
     @property
+    def google_account(self) -> str | None:
+        """The Google account this client authenticates as (see sync.favorite_ledger)."""
+        from immich_gphotos.sync.favorite_ledger import google_identity
+
+        return google_identity(self._auth_data)
+
+    @property
     def quality(self) -> Quality:
         return self._quality
 

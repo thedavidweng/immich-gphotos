@@ -62,13 +62,29 @@ class FavoriteSyncer:
     per-item read-back through gpmc, so nothing here claims a verified one.
     """
 
-    def __init__(self, gphotos: GooglePhotosClient, assets: AssetRepo) -> None:
+    def __init__(
+        self,
+        gphotos: GooglePhotosClient,
+        assets: AssetRepo,
+        *,
+        ledger=None,  # noqa: ANN001 - sync.favorite_ledger.SharedFavoriteLedger
+        google_account: str | None = None,
+        account_id: str | None = None,
+    ) -> None:
         self._gphotos = gphotos
         self._assets = assets
         self._locks: dict[str, threading.Lock] = {}
         self._locks_guard = threading.Lock()
+        # Cross-account agreement for service accounts that back up into the
+        # same Google account (see sync.favorite_ledger). Inactive unless all
+        # three are known.
+        self._ledger = ledger if (ledger is not None and google_account and account_id) else None
+        self._google = google_account
+        self._account_id = account_id
 
     def _lock_for(self, media_key: str) -> threading.Lock:
+        if self._ledger is not None:
+            return self._ledger.lock_for(self._google, media_key)
         with self._locks_guard:
             lock = self._locks.get(media_key)
             if lock is None:
@@ -94,7 +110,11 @@ class FavoriteSyncer:
         """Decide and (if needed) push one item's star.
 
         Returns "synced", "noop", "held", "protected" or raises the
-        underlying error from `set_favorite`.
+        underlying error from `set_favorite`. With a shared ledger, the
+        decision also counts every other service account backing up into
+        the same Google account: any of them wanting the star keeps it, any
+        of them in flux holds an unstar, and a star put there by any of
+        them counts as this service's own.
         """
         with self._lock_for(media_key):
             rows = self._assets.rows_for_media_key(media_key)
@@ -104,34 +124,54 @@ class FavoriteSyncer:
                 if not (r.state is AssetState.INELIGIBLE and r.ineligible_reason == _DELETED_REASON)
             ]
             live = [r for r in relevant if r.state is AssetState.SYNCED and not r.asset.is_trashed]
-            if not live:
-                self._assets.touch_favorite_remote(media_key)
-                return "held"
-            want = any(r.asset.is_favorite for r in live)
-            if not want and len(live) != len(relevant):
-                self._assets.touch_favorite_remote(media_key)
-                return "held"
             remote = self._remote(media_key, rows)
+            local_want = any(r.asset.is_favorite for r in live)
+            local_held = not live or (not local_want and len(live) != len(relevant))
+            others = []
+            if self._ledger is not None:
+                self._ledger.publish(
+                    self._google,
+                    media_key,
+                    self._account_id,
+                    intent=None if local_held else local_want,
+                    managed=remote.managed,
+                )
+                others = self._ledger.others(self._google, media_key, self._account_id)
+            if local_held:
+                self._assets.touch_favorite_remote(media_key)
+                return "held"
+            want = local_want or any(o.intent is True for o in others)
+            if not want and any(o.intent is None for o in others):
+                self._assets.touch_favorite_remote(media_key)
+                return "held"
+            pushed = remote.pushed
+            if self._ledger is not None:
+                shared = self._ledger.pushed(self._google, media_key)
+                if shared is not None:
+                    pushed = shared
+            managed_any = remote.managed or any(o.managed for o in others)
             outcome = "noop"
             managed = remote.managed
-            pushed = remote.pushed
-            if want and remote.pushed is not True:
+            if want and pushed is not True:
                 self._gphotos.set_favorite(media_key, True)
                 # Starting from a known-unstarred item this service created
                 # itself, the star is provably ours.
-                managed = remote.managed or (
-                    remote.pushed is not True and self._assets.media_key_uploaded_here(media_key)
-                )
+                managed = remote.managed or self._assets.media_key_uploaded_here(media_key)
                 pushed = True
                 outcome = "synced"
-            elif not want and remote.pushed is True:
-                if not remote.managed:
+            elif not want and pushed is True:
+                if not managed_any:
                     outcome = "protected"
                 else:
                     self._gphotos.set_favorite(media_key, False)
                     pushed = False
                     outcome = "synced"
-            self._assets.record_favorite_remote(media_key, pushed=pushed, managed=managed, intent=want)
+            self._assets.record_favorite_remote(media_key, pushed=pushed, managed=managed, intent=local_want)
+            if self._ledger is not None:
+                self._ledger.record_pushed(self._google, media_key, pushed)
+                self._ledger.publish(
+                    self._google, media_key, self._account_id, intent=local_want, managed=managed
+                )
             for r in live:
                 self._assets.settle_favorite_row(r.asset.immich_id, r.asset.is_favorite)
             return outcome

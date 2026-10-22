@@ -112,6 +112,8 @@ def build_runtime_graph(
     direct_roots: tuple[Path, ...] | None = None,
     bandwidth: TokenBucket | None = None,
     gate: AbstractContextManager[Any] | None = None,
+    favorite_ledger: Any = None,
+    account_id: str | None = None,
 ) -> tuple[Runtime, BackfillJob, BackgroundLoops]:
     """Construct one fresh copy of everything that closes over clients/settings.
 
@@ -138,7 +140,17 @@ def build_runtime_graph(
         assets=assets,
         xmp=ExifToolMotionPhotoXmp.if_available(),
     )
-    favorite_syncer = FavoriteSyncer(gphotos, assets)
+    # `favorite_ledger` (the control database's sync.favorite_ledger) lets
+    # service accounts that back up into the same Google account agree on
+    # stars; the Google identity comes from the client itself, so a wizard
+    # re-auth to a different Google account re-scopes it automatically.
+    favorite_syncer = FavoriteSyncer(
+        gphotos,
+        assets,
+        ledger=favorite_ledger,
+        google_account=getattr(gphotos, "google_account", None),
+        account_id=account_id,
+    )
     live_photos = LivePhotoCompleter(assets, gphotos, resolver, clock, settings.live_photo_mode)
     worker = Worker(
         assets,
@@ -227,6 +239,8 @@ def rebuild_runtime(
         direct_roots=services.direct_roots,
         bandwidth=services.bandwidth,
         gate=services.gate,
+        favorite_ledger=services.favorite_ledger,
+        account_id=services.account_id,
     )
 
     # A fresh Runtime/BackgroundLoops otherwise starts unpaused, so any

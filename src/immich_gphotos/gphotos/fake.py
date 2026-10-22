@@ -24,6 +24,9 @@ class FakeGooglePhotosClient:
         # Uploads whose bytes were streamed (whether or not an item was then
         # created) and an optional hook run just before the commit check.
         self.streamed: list[str] = []
+        # Which Google account this fake "is" (sync.favorite_ledger); two
+        # service accounts sharing one fake model a shared Google account.
+        self.google_account: str | None = None
         self.before_commit = None
         self.favorites: dict[str, bool] = {}
         self.favorite_calls: list[tuple[str, bool]] = []
