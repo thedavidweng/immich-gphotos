@@ -38,6 +38,9 @@ class Services:
     redactor: Any = None  # logging.Redactor; shared with the log handler, grown via add_secret
     scratch: Path | None = None  # where ByteResolver stages downloads; needed to rebuild it
     allow_direct: bool = True  # IGP_ALLOW_DIRECT_READS, needed to rebuild ByteResolver
+    # The validated read-only library roots a direct read may come from
+    # (`accounts.build.direct_read_roots`); None means ByteResolver's default.
+    direct_roots: tuple[Path, ...] | None = None
     loops_handle: Any = None  # sync.loops.LoopsHandle; the live-swap target for the background loop
     # The process-wide shared limiters (Task 6): sync.throttle.TokenBucket
     # (or None, meaning no cap) and a context manager gating concurrent

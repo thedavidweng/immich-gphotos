@@ -201,6 +201,10 @@ Without the mount, or when a file isn't readable, it falls back automatically to
 
 Set `IGP_ALLOW_DIRECT_READS=false` to force the API-download path even when the mount is present.
 
+**Only configured, read-only roots are trusted.** `originalPath` comes from the Immich API, so a direct read is only allowed when the fully resolved path (symlinks followed) lies inside a configured library root: by default just `/usr/src/app/upload`. If your library is mounted elsewhere, or you also want External Library folders read directly, list every root in `IGP_DIRECT_READ_ROOTS` (comma- or `:`-separated). Each root must be mounted read-only (`:ro`); a writable mount is skipped unless you set `IGP_DIRECT_READ_ALLOW_WRITABLE=true` (the service still never writes there). `/` and anything containing this service's own data directory are always refused. Any path outside the roots — `..` tricks, a symlink pointing out of the library, the data directory — is downloaded through the Immich API instead. **Upgrade note:** if you mounted your library somewhere other than `/usr/src/app/upload`, set `IGP_DIRECT_READ_ROOTS` or those assets will take the (slower, still correct) API-download path.
+
+A direct original whose file changes while it is being read or uploaded is never recorded under a stale hash: the read falls back to the API download, and an upload that raced a rewrite is retried. Uploads whose capture date could not be confirmed (no date known, or the scratch copy/stamp failed) still go up, and are counted as `timestamp_unverified` under `sync_notes` in `/api/status`.
+
 ## Environment variables
 
 All optional, all with working defaults, and **none of them ever carry a credential** — those live only in the database, entered through the wizard.

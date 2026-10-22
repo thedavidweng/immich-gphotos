@@ -50,7 +50,13 @@ CREATE TABLE IF NOT EXISTS asset (
   -- carry a virtual sha1(path) checksum, so the delete path sends this
   -- column when set and falls back to `checksum` otherwise (for which it
   -- is exact). See sync.bytes and sync.deletions.
-  upload_sha1 TEXT
+  upload_sha1 TEXT,
+  -- Non-fatal diagnostics recorded when the row last synced, as a
+  -- comma-separated list of stable codes (e.g. `timestamp_unverified`: the
+  -- capture date on the uploaded bytes could not be confirmed). NULL means
+  -- none. Never a reason to retry -- the bytes are safe -- only a reason not
+  -- to claim something was verified when it was not.
+  sync_notes TEXT
 );
 CREATE INDEX IF NOT EXISTS asset_queue ON asset(state, priority, next_attempt_at);
 CREATE INDEX IF NOT EXISTS asset_checksum ON asset(checksum);
@@ -93,6 +99,7 @@ COLUMN_MIGRATIONS: tuple[tuple[str, str, str], ...] = (
     ("asset", "favorite_synced", "ALTER TABLE asset ADD COLUMN favorite_synced INTEGER"),
     ("asset", "live_photo_video_id", "ALTER TABLE asset ADD COLUMN live_photo_video_id TEXT"),
     ("asset", "upload_sha1", "ALTER TABLE asset ADD COLUMN upload_sha1 TEXT"),
+    ("asset", "sync_notes", "ALTER TABLE asset ADD COLUMN sync_notes TEXT"),
 )
 
 

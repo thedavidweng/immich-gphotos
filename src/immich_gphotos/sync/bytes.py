@@ -3,7 +3,9 @@ import hashlib
 import logging
 import os
 import shutil
+import stat
 import uuid
+from collections.abc import Iterable
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
@@ -22,6 +24,41 @@ logger = logging.getLogger(__name__)
 # without copying libraries whose mtimes are merely rounded.
 MTIME_TOLERANCE_SECONDS = 2.0
 
+# Where Immich's own container keeps its library by default -- the one root a
+# direct read is allowed from when nothing else is configured (see
+# `accounts.build.direct_read_roots`). `originalPath` comes from the Immich
+# API verbatim, so without a root allowlist any path Immich reports (or a
+# compromised/misconfigured Immich could report) -- this service's own
+# database, its credentials, /proc -- would be read and uploaded as "media".
+DEFAULT_DIRECT_READ_ROOTS: tuple[Path, ...] = (Path("/usr/src/app/upload"),)
+
+# A diagnostic attached to a resolution whose capture date could not be
+# confirmed on the bytes handed to gpmc (no date known, a stamp that failed,
+# a scratch copy that could not be made). Never fatal: the bytes still go up,
+# Google simply dates them as it would have before. Recorded on the asset row
+# (`sync_notes`) so "the date is right" is never assumed when it was not
+# checked. See `ResolvedBytes.notes`.
+TIMESTAMP_UNVERIFIED = "timestamp_unverified"
+
+_HASH_CHUNK = 1024 * 1024
+
+
+class SourceChangedError(OSError):
+    """A direct-read original changed while it was being read.
+
+    Raised when the file's identity (device, inode, size, mtime) differs
+    between the stat taken before reading and the one taken after, or when
+    the opened descriptor is not the file that was checked. The resolver
+    treats it as "do not trust the library copy right now" and falls back to
+    the Immich API download; the worker treats one raised after upload as a
+    retryable unavailability. Subclasses OSError so every existing handler
+    that already treats an unreadable source as retryable keeps doing so.
+    """
+
+
+def _identity(st: os.stat_result) -> tuple[int, int, int, int]:
+    return (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns)
+
 
 def _parse_taken_at(taken_at: str | None) -> float | None:
     """Parse Immich's `fileCreatedAt` to a unix timestamp, or None.
@@ -38,7 +75,7 @@ def _parse_taken_at(taken_at: str | None) -> float | None:
         return None
 
 
-def _stamp_capture_date(path: Path, taken_at: str | None) -> None:
+def _stamp_capture_date(path: Path, taken_at: str | None) -> bool:
     """Set `path`'s mtime to when the asset was actually taken.
 
     gpmc uploads a file's `st_mtime` to Google as the capture timestamp, and
@@ -50,14 +87,19 @@ def _stamp_capture_date(path: Path, taken_at: str | None) -> None:
     Best-effort by design: a missing, malformed or unrepresentable date leaves
     the file alone and the asset still uploads, dated by Google as before. A
     timestamp is never worth failing a backup over.
+
+    Returns True only when the date was parsed *and* written, so callers
+    can report `TIMESTAMP_UNVERIFIED` for everything else.
     """
     when = _parse_taken_at(taken_at)
     if when is None:
-        return
+        return False
     try:
         os.utime(path, (when, when))
     except (OSError, OverflowError) as exc:
         logger.debug("could not stamp capture date %r onto %s: %s", taken_at, path.name, exc)
+        return False
+    return True
 
 
 def _sha1_base64_of_file(path: Path) -> str:
@@ -73,8 +115,31 @@ def _sha1_base64_of_file(path: Path) -> str:
     """
     digest = hashlib.sha1()
     with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+        for chunk in iter(lambda: handle.read(_HASH_CHUNK), b""):
             digest.update(chunk)
+    return base64.b64encode(digest.digest()).decode("ascii")
+
+
+def _sha1_base64_of_stable_file(path: Path, expected: tuple[int, int, int, int]) -> str:
+    """Hash a direct-read original, refusing one that changed underneath us.
+
+    Opened with O_NOFOLLOW (the path is already the resolved real path, so a
+    symlink appearing here means it was swapped after the allowlist check),
+    the open descriptor's identity is compared with the pre-read stat, and
+    the path is stat'ed again after the last byte: a file replaced, appended
+    to or rewritten between check and read raises `SourceChangedError`
+    instead of being hashed as if it were the file that was checked.
+    """
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(path, flags)
+    with os.fdopen(fd, "rb") as handle:
+        if _identity(os.fstat(handle.fileno())) != expected:
+            raise SourceChangedError(f"{path.name} changed before it could be read")
+        digest = hashlib.sha1()
+        for chunk in iter(lambda: handle.read(_HASH_CHUNK), b""):
+            digest.update(chunk)
+    if _identity(os.stat(path, follow_symlinks=False)) != expected:
+        raise SourceChangedError(f"{path.name} changed while it was being read")
     return base64.b64encode(digest.digest()).decode("ascii")
 
 
@@ -93,6 +158,18 @@ class ResolvedBytes:
     # This is the value google-side consumers must be given; see
     # `_sha1_base64_of_file` for why Immich's checksum step is never used.
     sha1_b64: str | None = None
+    # For a direct-read original (temporary=False): the (dev, inode, size,
+    # mtime_ns) identity it was checked and hashed under. The worker asks
+    # `ByteResolver.still_unchanged` after the upload so bytes that changed
+    # while gpmc was reading them are never recorded under a hash they no
+    # longer have. None for scratch files, which only this process writes.
+    source_identity: tuple[int, int, int, int] | None = None
+    # Non-fatal diagnostics about this resolution (e.g. TIMESTAMP_UNVERIFIED).
+    notes: tuple[str, ...] = ()
+
+
+def _within(path: Path, root: Path) -> bool:
+    return path == root or root in path.parents
 
 
 class ByteResolver:
@@ -110,6 +187,14 @@ class ByteResolver:
     never modified (its library is mounted read-only) and never re-dated.
 
     Otherwise the original is downloaded to scratch and deleted afterwards.
+
+    A direct read is only ever attempted for a path that, once fully
+    resolved (symlinks included), lies inside one of `direct_roots` -- the
+    read-only Immich library mount(s) the operator configured -- and never
+    inside this service's own scratch directory. Anything else (a relative
+    path, `..` games, a symlink pointing out of the library, a path to the
+    data directory) is downloaded through the Immich API instead, so
+    `originalPath` can never turn into "read any file in the container".
 
     An Apple Live Photo still (one carrying `live_photo_video_id`) is muxed
     with its companion `.MOV` into a single Google Motion Photo before it is
@@ -129,12 +214,53 @@ class ByteResolver:
         allow_direct: bool = True,
         assets=None,  # noqa: ANN001 - AssetRepo; only for the Live Photo companion lookup
         xmp=None,  # noqa: ANN001 - sync.exif_xmp.MotionPhotoXmp; None disables HEIC muxing
+        direct_roots: Iterable[Path] | None = None,
     ) -> None:
         self._immich = immich
         self._scratch = Path(scratch)
         self._allow_direct = allow_direct
+        roots = DEFAULT_DIRECT_READ_ROOTS if direct_roots is None else tuple(direct_roots)
+        resolved_roots: list[Path] = []
+        for root in roots:
+            try:
+                resolved_roots.append(Path(root).resolve(strict=False))
+            except (OSError, RuntimeError):
+                continue
+        self._direct_roots = tuple(resolved_roots)
         self._assets = assets
         self._xmp = xmp
+
+    def _allowed_direct_path(self, original_path: str) -> Path | None:
+        """The real path of `original_path` when a direct read is allowed, else None.
+
+        Allowed means: absolute, fully resolvable (every symlink followed),
+        a regular file, inside one of the configured library roots and not
+        inside scratch. The *resolved* path is what is returned and read, so
+        a symlink inside the library that points outside it is refused here
+        rather than followed later.
+        """
+        if not self._direct_roots:
+            return None
+        candidate = Path(original_path)
+        if not candidate.is_absolute():
+            return None
+        try:
+            real = candidate.resolve(strict=True)
+            st = os.stat(real, follow_symlinks=False)
+        except (OSError, RuntimeError):
+            return None
+        if not stat.S_ISREG(st.st_mode):
+            return None
+        try:
+            scratch = self._scratch.resolve(strict=False)
+        except (OSError, RuntimeError):
+            scratch = self._scratch
+        if _within(real, scratch):
+            return None
+        if not any(_within(real, root) for root in self._direct_roots):
+            logger.debug("refusing direct read outside the library roots: %s", real)
+            return None
+        return real
 
     def _direct_or_copy(self, candidate: Path, asset: Asset, taken_at: str | None) -> ResolvedBytes:
         """Hand back `candidate` itself when its mtime already agrees with the
@@ -142,33 +268,63 @@ class ByteResolver:
 
         `taken_at` is the resolved capture-date string (already falling back
         to a lookup for legacy rows); None means there is no date to check
-        against, so the file goes up as-is, as before.
+        against, so the file goes up as-is, as before -- flagged
+        `TIMESTAMP_UNVERIFIED`, since nothing confirmed its mtime.
+
+        Raises OSError (the caller falls back to the API download) when the
+        file vanishes, or `SourceChangedError` when it changes while being
+        copied. A copy that fails part-way removes its own partial scratch
+        file -- only that nonce path, never anything in the library -- so a
+        long NAS sync cannot fill the disk with orphaned partial copies.
         """
+        before = os.stat(candidate, follow_symlinks=False)
+        identity = _identity(before)
         when = _parse_taken_at(taken_at)
         if when is None:
-            return ResolvedBytes(path=candidate, temporary=False)
-        try:
-            mtime = candidate.stat().st_mtime
-        except OSError:
-            # Gone or unreadable between the is_file() check and now: let the
-            # caller fall through to the API-download path by signalling
-            # "no direct file" with an exception the caller treats that way.
-            # Simpler than returning a sentinel, and never fails the backup
-            # on a race.
-            raise
-        if abs(mtime - when) <= MTIME_TOLERANCE_SECONDS:
-            return ResolvedBytes(path=candidate, temporary=False)
+            return ResolvedBytes(
+                path=candidate, temporary=False, source_identity=identity, notes=(TIMESTAMP_UNVERIFIED,)
+            )
+        if abs(before.st_mtime - when) <= MTIME_TOLERANCE_SECONDS:
+            return ResolvedBytes(path=candidate, temporary=False, source_identity=identity)
         dest = self._scratch_path(asset)
         try:
-            shutil.copyfile(candidate, dest)
+            shutil.copyfile(candidate, dest, follow_symlinks=False)
         except OSError as exc:
+            dest.unlink(missing_ok=True)
             # The copy is an optimisation for correctness; losing it must
             # never lose the backup. Fall back to handing back the original:
-            # the upload still happens, dated by Google as before.
+            # the upload still happens, dated by Google as before -- and
+            # flagged, so nobody mistakes it for a verified date.
             logger.debug("could not copy %s to scratch for re-dating: %s", candidate.name, exc)
-            return ResolvedBytes(path=candidate, temporary=False)
-        _stamp_capture_date(dest, taken_at)
+            return ResolvedBytes(
+                path=candidate, temporary=False, source_identity=identity, notes=(TIMESTAMP_UNVERIFIED,)
+            )
+        try:
+            after = os.stat(candidate, follow_symlinks=False)
+        except OSError:
+            dest.unlink(missing_ok=True)
+            raise
+        if _identity(after) != identity:
+            dest.unlink(missing_ok=True)
+            raise SourceChangedError(f"{candidate.name} changed while it was being copied")
+        if not _stamp_capture_date(dest, taken_at):
+            return ResolvedBytes(path=dest, temporary=True, notes=(TIMESTAMP_UNVERIFIED,))
         return ResolvedBytes(path=dest, temporary=True)
+
+    def still_unchanged(self, resolved: ResolvedBytes) -> bool:
+        """Whether a direct-read original is still the file that was hashed.
+
+        Always True for scratch files. For a direct read, compares the file's
+        current identity with the one it was hashed under -- the worker calls
+        this after the upload so a library file rewritten while gpmc was
+        streaming it is retried instead of recorded under a stale hash.
+        """
+        if resolved.temporary or resolved.source_identity is None:
+            return True
+        try:
+            return _identity(os.stat(resolved.path, follow_symlinks=False)) == resolved.source_identity
+        except OSError:
+            return False
 
     def resolve(self, asset: Asset) -> ResolvedBytes:
         """Resolve `asset`'s bytes and certify their content SHA-1.
@@ -187,7 +343,21 @@ class ByteResolver:
             resolved = self._try_resolve_live_photo(asset)
         if resolved is None:
             resolved = self._resolve_single(asset)
-        return replace(resolved, sha1_b64=_sha1_base64_of_file(resolved.path))
+        return self._certify(asset, resolved)
+
+    def _certify(self, asset: Asset, resolved: ResolvedBytes) -> ResolvedBytes:
+        """Attach the content SHA-1, re-resolving through the API if a direct
+        original changed while being hashed."""
+        if resolved.temporary or resolved.source_identity is None:
+            return replace(resolved, sha1_b64=_sha1_base64_of_file(resolved.path))
+        try:
+            return replace(
+                resolved, sha1_b64=_sha1_base64_of_stable_file(resolved.path, resolved.source_identity)
+            )
+        except OSError as exc:
+            logger.debug("direct original %s unstable, downloading instead: %s", asset.immich_id, exc)
+            downloaded = self._download(asset)
+            return replace(downloaded, sha1_b64=_sha1_base64_of_file(downloaded.path))
 
     def _scratch_path(self, asset: Asset) -> Path:
         """A fresh scratch path for one resolution.
@@ -339,20 +509,28 @@ class ByteResolver:
 
     def _resolve_single(self, asset: Asset) -> ResolvedBytes:
         if self._allow_direct and asset.original_path:
-            candidate = Path(asset.original_path)
-            if candidate.is_file():
+            candidate = self._allowed_direct_path(asset.original_path)
+            if candidate is not None:
                 try:
                     return self._direct_or_copy(
                         candidate, asset, asset.taken_at or self._lookup_taken_at(asset)
                     )
-                except OSError:
-                    pass
+                except OSError as exc:
+                    logger.debug("direct read of %s failed, downloading: %s", asset.immich_id, exc)
+        return self._download(asset)
+
+    def _download(self, asset: Asset) -> ResolvedBytes:
         dest = self._scratch_path(asset)
-        self._immich.download_original(asset.immich_id, dest)
+        try:
+            self._immich.download_original(asset.immich_id, dest)
+        except BaseException:
+            dest.unlink(missing_ok=True)
+            raise
         # The scratch copy only: a direct-read original is either already
         # correct (handed back above) or was copied-and-stamped there, and
         # Immich's library is mounted read-only.
-        _stamp_capture_date(dest, asset.taken_at or self._lookup_taken_at(asset))
+        if not _stamp_capture_date(dest, asset.taken_at or self._lookup_taken_at(asset)):
+            return ResolvedBytes(path=dest, temporary=True, notes=(TIMESTAMP_UNVERIFIED,))
         return ResolvedBytes(path=dest, temporary=True)
 
     def _lookup_taken_at(self, asset: Asset) -> str | None:

@@ -79,7 +79,7 @@ def _rig(tmp_path):
     assets = AssetRepo(connect(tmp_path / "t.db"), clock)
     immich = FakeImmichClient(contents={"still-1": STILL_BYTES, "mov-1": VIDEO_BYTES})
     gphotos = FakeGooglePhotosClient()
-    resolver = ByteResolver(immich, scratch=tmp_path / "scratch", assets=assets)
+    resolver = ByteResolver(immich, scratch=tmp_path / "scratch", direct_roots=[tmp_path], assets=assets)
     worker = Worker(assets, gphotos, resolver, Filters(), RetryPolicy(jitter=0.0), clock)
     return worker, assets, immich, gphotos
 
@@ -143,7 +143,7 @@ def test_heic_still_falls_back_without_pairing(tmp_path):
     assets = AssetRepo(connect(tmp_path / "t.db"), clock)
     immich = FakeImmichClient(contents={"still-1": heic, "mov-1": VIDEO_BYTES})
     gphotos = FakeGooglePhotosClient()
-    resolver = ByteResolver(immich, scratch=tmp_path / "scratch", assets=assets)
+    resolver = ByteResolver(immich, scratch=tmp_path / "scratch", direct_roots=[tmp_path], assets=assets)
     worker = Worker(assets, gphotos, resolver, Filters(), RetryPolicy(jitter=0.0), clock)
     _enqueue(assets)
 
@@ -170,7 +170,9 @@ def test_heic_pair_is_muxed_via_exiftool_and_paired_on_upload(tmp_path):
     assets = AssetRepo(connect(tmp_path / "t.db"), clock)
     immich = FakeImmichClient(contents={"still-1": heic_bytes, "mov-1": VIDEO_BYTES})
     gphotos = FakeGooglePhotosClient()
-    resolver = ByteResolver(immich, scratch=tmp_path / "scratch", assets=assets, xmp=fake)
+    resolver = ByteResolver(
+        immich, scratch=tmp_path / "scratch", direct_roots=[tmp_path], assets=assets, xmp=fake
+    )
     worker = Worker(assets, gphotos, resolver, Filters(), RetryPolicy(jitter=0.0), clock)
     assets.upsert_pending(heic_still, Priority.WEBHOOK)
     assets.upsert_pending(MOV, Priority.WEBHOOK)
@@ -203,7 +205,9 @@ def test_heic_falls_back_when_exiftool_is_missing_or_refuses(tmp_path):
         assets = AssetRepo(connect(tmp_path / f"t{index}.db"), clock)
         immich = FakeImmichClient(contents={"still-1": heic_bytes, "mov-1": VIDEO_BYTES})
         gphotos = FakeGooglePhotosClient()
-        resolver = ByteResolver(immich, scratch=tmp_path / "scratch", assets=assets, xmp=xmp)
+        resolver = ByteResolver(
+            immich, scratch=tmp_path / "scratch", direct_roots=[tmp_path], assets=assets, xmp=xmp
+        )
         worker = Worker(assets, gphotos, resolver, Filters(), RetryPolicy(jitter=0.0), clock)
         assets.upsert_pending(
             replace(STILL, filename="IMG_1.HEIC", live_photo_video_id="mov-1"), Priority.WEBHOOK
@@ -238,7 +242,7 @@ def test_direct_read_pair_is_muxed_without_touching_originals(tmp_path):
     clock = FakeClock()
     assets = AssetRepo(connect(tmp_path / "t.db"), clock)
     immich = FakeImmichClient()
-    resolver = ByteResolver(immich, scratch=tmp_path / "scratch", assets=assets)
+    resolver = ByteResolver(immich, scratch=tmp_path / "scratch", direct_roots=[tmp_path], assets=assets)
     assets.upsert_pending(replace(STILL, original_path=str(still_path)), Priority.WEBHOOK)
     assets.upsert_pending(replace(MOV, original_path=str(mov_path)), Priority.WEBHOOK)
 

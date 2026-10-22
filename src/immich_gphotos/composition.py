@@ -108,6 +108,7 @@ def build_runtime_graph(
     clock: Clock,
     scratch: Path,
     allow_direct: bool,
+    direct_roots: tuple[Path, ...] | None = None,
     bandwidth: TokenBucket | None = None,
     gate: AbstractContextManager[Any] | None = None,
 ) -> tuple[Runtime, BackfillJob, BackgroundLoops]:
@@ -132,6 +133,7 @@ def build_runtime_graph(
         immich,
         scratch=scratch,
         allow_direct=allow_direct,
+        direct_roots=direct_roots,
         assets=assets,
         xmp=ExifToolMotionPhotoXmp.if_available(),
     )
@@ -215,6 +217,7 @@ def rebuild_runtime(
         clock=services.clock,
         scratch=services.scratch or Path("scratch"),
         allow_direct=services.allow_direct,
+        direct_roots=services.direct_roots,
         bandwidth=services.bandwidth,
         gate=services.gate,
     )

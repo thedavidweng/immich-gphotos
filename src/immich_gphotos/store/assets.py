@@ -162,7 +162,12 @@ class AssetRepo:
         return [_row_to_stored(r) for r in rows]
 
     def mark_synced(
-        self, immich_id: str, media_key: str, outcome: Outcome, upload_sha1: str | None = None
+        self,
+        immich_id: str,
+        media_key: str,
+        outcome: Outcome,
+        upload_sha1: str | None = None,
+        notes: Sequence[str] = (),
     ) -> None:
         """Record a synced asset.
 
@@ -172,11 +177,16 @@ class AssetRepo:
         the delete path can trash by the key Google actually knows; left
         None when the sync happened without touching bytes (checksum-keyed
         dedup hits), where the fallback in `sync.deletions` applies.
+
+        `notes` are the resolution's non-fatal diagnostics (see
+        `sync.bytes.TIMESTAMP_UNVERIFIED`), replacing whatever the row
+        carried before.
         """
         with self._conn.lock:
             self._conn.execute(
                 "UPDATE asset SET state = ?, outcome = ?, media_key = ?, upload_sha1 = ?,"
-                " synced_at = ?, error_class = NULL, last_error = NULL, claimed_at = NULL"
+                " synced_at = ?, error_class = NULL, last_error = NULL, claimed_at = NULL,"
+                " sync_notes = ?"
                 " WHERE immich_id = ?",
                 (
                     AssetState.SYNCED.value,
@@ -184,9 +194,24 @@ class AssetRepo:
                     media_key,
                     upload_sha1,
                     self._clock.now().isoformat(),
+                    ",".join(sorted(set(notes))) or None,
                     immich_id,
                 ),
             )
+
+    def sync_note_counts(self) -> dict[str, int]:
+        """How many SYNCED rows carry each diagnostic code."""
+        with self._conn.lock:
+            rows = self._conn.execute(
+                "SELECT sync_notes FROM asset WHERE state = ? AND sync_notes IS NOT NULL",
+                (AssetState.SYNCED.value,),
+            ).fetchall()
+        counts: dict[str, int] = {}
+        for row in rows:
+            for code in row["sync_notes"].split(","):
+                if code:
+                    counts[code] = counts.get(code, 0) + 1
+        return counts
 
     def mark_ineligible(self, immich_id: str, reason: str) -> None:
         with self._conn.lock:

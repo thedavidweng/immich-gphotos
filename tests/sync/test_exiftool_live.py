@@ -88,7 +88,9 @@ def test_real_exiftool_full_heic_mux_flow(tmp_path):
     immich = FakeImmichClient(contents={"still-1": heic_bytes, "mov-1": VIDEO})
     gphotos = FakeGooglePhotosClient()
     xmp = ExifToolMotionPhotoXmp()
-    resolver = ByteResolver(immich, scratch=tmp_path / "scratch", assets=assets, xmp=xmp)
+    resolver = ByteResolver(
+        immich, scratch=tmp_path / "scratch", direct_roots=[tmp_path], assets=assets, xmp=xmp
+    )
     worker = Worker(assets, gphotos, resolver, Filters(), RetryPolicy(jitter=0.0), clock)
     assets.upsert_pending(still, Priority.WEBHOOK)
     assets.upsert_pending(mov, Priority.WEBHOOK)

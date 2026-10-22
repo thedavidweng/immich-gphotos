@@ -26,7 +26,7 @@ def test_direct_read_is_used_when_the_original_path_exists(tmp_path):
     original.parent.mkdir()
     original.write_bytes(b"ABC")
     immich = FakeImmichClient()
-    resolver = ByteResolver(immich, scratch=tmp_path / "scratch")
+    resolver = ByteResolver(immich, scratch=tmp_path / "scratch", direct_roots=[tmp_path])
     resolved = resolver.resolve(replace(ASSET, original_path=str(original)))
     assert resolved.path == original
     assert resolved.temporary is False
@@ -47,7 +47,9 @@ def test_resolve_certifies_the_content_sha1_of_the_bytes(tmp_path):
     original = tmp_path / "library" / "a.jpg"
     original.parent.mkdir()
     original.write_bytes(b"ABC")
-    resolver = ByteResolver(FakeImmichClient(contents={"a1": b"XYZ"}), scratch=tmp_path / "scratch")
+    resolver = ByteResolver(
+        FakeImmichClient(contents={"a1": b"XYZ"}), scratch=tmp_path / "scratch", direct_roots=[tmp_path]
+    )
 
     direct = resolver.resolve(replace(ASSET, original_path=str(original)))
     assert direct.sha1_b64 == sha1_b64(b"ABC")
@@ -59,7 +61,7 @@ def test_resolve_certifies_the_content_sha1_of_the_bytes(tmp_path):
 
 def test_falls_back_to_api_download_when_the_path_is_not_readable(tmp_path):
     immich = FakeImmichClient(contents={"a1": b"XYZ"})
-    resolver = ByteResolver(immich, scratch=tmp_path / "scratch")
+    resolver = ByteResolver(immich, scratch=tmp_path / "scratch", direct_roots=[tmp_path])
     resolved = resolver.resolve(ASSET)
     assert resolved.temporary is True
     assert resolved.path.read_bytes() == b"XYZ"
@@ -70,7 +72,7 @@ def test_direct_read_can_be_disabled(tmp_path):
     original = tmp_path / "a.jpg"
     original.write_bytes(b"ABC")
     immich = FakeImmichClient(contents={"a1": b"XYZ"})
-    resolver = ByteResolver(immich, scratch=tmp_path / "scratch", allow_direct=False)
+    resolver = ByteResolver(immich, scratch=tmp_path / "scratch", direct_roots=[tmp_path], allow_direct=False)
     resolved = resolver.resolve(replace(ASSET, original_path=str(original)))
     assert resolved.temporary is True
     assert immich.downloads == ["a1"]
@@ -80,7 +82,7 @@ def test_release_removes_only_temporary_files(tmp_path):
     original = tmp_path / "a.jpg"
     original.write_bytes(b"ABC")
     immich = FakeImmichClient(contents={"a1": b"XYZ"})
-    resolver = ByteResolver(immich, scratch=tmp_path / "scratch")
+    resolver = ByteResolver(immich, scratch=tmp_path / "scratch", direct_roots=[tmp_path])
 
     direct = resolver.resolve(replace(ASSET, original_path=str(original)))
     resolver.release(direct)
@@ -94,7 +96,7 @@ def test_release_removes_only_temporary_files(tmp_path):
 
 def test_release_is_safe_to_call_twice(tmp_path):
     immich = FakeImmichClient(contents={"a1": b"XYZ"})
-    resolver = ByteResolver(immich, scratch=tmp_path / "scratch")
+    resolver = ByteResolver(immich, scratch=tmp_path / "scratch", direct_roots=[tmp_path])
     resolved = resolver.resolve(ASSET)
     resolver.release(resolved)
     resolver.release(resolved)
@@ -102,7 +104,7 @@ def test_release_is_safe_to_call_twice(tmp_path):
 
 def test_concurrent_resolutions_of_the_same_asset_use_different_paths(tmp_path):
     immich = FakeImmichClient(contents={"a1": b"XYZ"})
-    resolver = ByteResolver(immich, scratch=tmp_path / "scratch")
+    resolver = ByteResolver(immich, scratch=tmp_path / "scratch", direct_roots=[tmp_path])
     first = resolver.resolve(ASSET)
     second = resolver.resolve(ASSET)
     assert first.path != second.path
@@ -112,7 +114,7 @@ def test_concurrent_resolutions_of_the_same_asset_use_different_paths(tmp_path):
 
 def test_filename_with_path_separator_lands_flat_in_scratch(tmp_path):
     immich = FakeImmichClient(contents={"a1": b"XYZ"})
-    resolver = ByteResolver(immich, scratch=tmp_path / "scratch")
+    resolver = ByteResolver(immich, scratch=tmp_path / "scratch", direct_roots=[tmp_path])
     tricky = replace(ASSET, filename="../../etc/a.jpg")
     resolved = resolver.resolve(tricky)
     assert resolved.path.parent == tmp_path / "scratch"
@@ -126,7 +128,7 @@ def test_downloaded_file_carries_the_capture_date_as_its_mtime(tmp_path):
     in Google Photos dated today instead of when they were taken.
     """
     immich = FakeImmichClient(contents={"a1": b"XYZ"})
-    resolver = ByteResolver(immich, scratch=tmp_path / "scratch")
+    resolver = ByteResolver(immich, scratch=tmp_path / "scratch", direct_roots=[tmp_path])
     resolved = resolver.resolve(replace(ASSET, taken_at="2022-07-05T12:00:00.000Z"))
 
     assert resolved.temporary is True
@@ -143,7 +145,7 @@ def test_direct_read_never_touches_the_mtime_of_immichs_own_file(tmp_path):
     original.write_bytes(b"ABC")
     os.utime(original, (1_000_000_000, 1_000_000_000))
     immich = FakeImmichClient()
-    resolver = ByteResolver(immich, scratch=tmp_path / "scratch")
+    resolver = ByteResolver(immich, scratch=tmp_path / "scratch", direct_roots=[tmp_path])
 
     resolved = resolver.resolve(replace(ASSET, original_path=str(original), taken_at="2022-07-05T12:00:00Z"))
 
@@ -169,7 +171,7 @@ def test_direct_read_is_used_as_is_when_its_mtime_already_matches(tmp_path):
     when = datetime.fromisoformat(taken_at.replace("Z", "+00:00")).timestamp()
     os.utime(original, (when, when))
     immich = FakeImmichClient()
-    resolver = ByteResolver(immich, scratch=tmp_path / "scratch")
+    resolver = ByteResolver(immich, scratch=tmp_path / "scratch", direct_roots=[tmp_path])
 
     resolved = resolver.resolve(replace(ASSET, original_path=str(original), taken_at=taken_at))
 
@@ -183,7 +185,7 @@ def test_an_unusable_capture_date_leaves_the_download_alone(tmp_path):
     """A missing or malformed date must never fail the upload -- the asset
     still syncs, it just falls back to Google's own dating."""
     immich = FakeImmichClient(contents={"a1": b"XYZ"})
-    resolver = ByteResolver(immich, scratch=tmp_path / "scratch")
+    resolver = ByteResolver(immich, scratch=tmp_path / "scratch", direct_roots=[tmp_path])
 
     for bad in (None, "", "not-a-date"):
         resolved = resolver.resolve(replace(ASSET, taken_at=bad))
@@ -197,7 +199,7 @@ def test_a_row_without_a_capture_date_is_looked_up_before_stamping(tmp_path):
     present at upgrade time would still land in Google Photos dated today.
     """
     immich = FakeImmichClient(contents={"a1": b"XYZ"}, taken_at={"a1": "2022-07-05T12:00:00.000Z"})
-    resolver = ByteResolver(immich, scratch=tmp_path / "scratch")
+    resolver = ByteResolver(immich, scratch=tmp_path / "scratch", direct_roots=[tmp_path])
 
     resolved = resolver.resolve(replace(ASSET, taken_at=None))
 
@@ -209,7 +211,7 @@ def test_a_row_without_a_capture_date_is_looked_up_before_stamping(tmp_path):
 
 def test_a_row_that_already_has_the_date_costs_no_extra_request(tmp_path):
     immich = FakeImmichClient(contents={"a1": b"XYZ"}, taken_at={"a1": "1999-01-01T00:00:00Z"})
-    resolver = ByteResolver(immich, scratch=tmp_path / "scratch")
+    resolver = ByteResolver(immich, scratch=tmp_path / "scratch", direct_roots=[tmp_path])
 
     resolved = resolver.resolve(replace(ASSET, taken_at="2022-07-05T12:00:00.000Z"))
 
@@ -228,7 +230,7 @@ def test_direct_read_looks_up_a_missing_capture_date_before_trusting_the_mtime(t
     original.write_bytes(b"ABC")
     os.utime(original, (1_000_000_000, 1_000_000_000))
     immich = FakeImmichClient(taken_at={"a1": "2022-07-05T12:00:00Z"})
-    resolver = ByteResolver(immich, scratch=tmp_path / "scratch")
+    resolver = ByteResolver(immich, scratch=tmp_path / "scratch", direct_roots=[tmp_path])
 
     resolved = resolver.resolve(replace(ASSET, original_path=str(original), taken_at=None))
 
@@ -245,7 +247,7 @@ def test_direct_read_with_no_date_anywhere_is_handed_back_as_is(tmp_path):
     original = tmp_path / "a.jpg"
     original.write_bytes(b"ABC")
     immich = FakeImmichClient()
-    resolver = ByteResolver(immich, scratch=tmp_path / "scratch")
+    resolver = ByteResolver(immich, scratch=tmp_path / "scratch", direct_roots=[tmp_path])
 
     resolved = resolver.resolve(replace(ASSET, original_path=str(original), taken_at=None))
 
@@ -259,7 +261,7 @@ def test_direct_read_with_an_unusable_capture_date_is_handed_back_as_is(tmp_path
     original.write_bytes(b"ABC")
     os.utime(original, (1_000_000_000, 1_000_000_000))
     immich = FakeImmichClient()
-    resolver = ByteResolver(immich, scratch=tmp_path / "scratch")
+    resolver = ByteResolver(immich, scratch=tmp_path / "scratch", direct_roots=[tmp_path])
 
     resolved = resolver.resolve(replace(ASSET, original_path=str(original), taken_at="not-a-date"))
 
@@ -276,7 +278,7 @@ def test_direct_read_tolerates_filesystem_granularity(tmp_path):
     when = datetime.fromisoformat(taken_at.replace("Z", "+00:00")).timestamp()
     os.utime(original, (when + 1, when + 1))
     immich = FakeImmichClient()
-    resolver = ByteResolver(immich, scratch=tmp_path / "scratch")
+    resolver = ByteResolver(immich, scratch=tmp_path / "scratch", direct_roots=[tmp_path])
 
     resolved = resolver.resolve(replace(ASSET, original_path=str(original), taken_at=taken_at))
 
@@ -293,7 +295,7 @@ def test_a_failing_lookup_still_yields_the_downloaded_bytes(tmp_path):
 
     immich = FakeImmichClient(contents={"a1": b"XYZ"})
     immich.asset_taken_at = boom
-    resolver = ByteResolver(immich, scratch=tmp_path / "scratch")
+    resolver = ByteResolver(immich, scratch=tmp_path / "scratch", direct_roots=[tmp_path])
 
     resolved = resolver.resolve(replace(ASSET, taken_at=None))
 
@@ -302,7 +304,7 @@ def test_a_failing_lookup_still_yields_the_downloaded_bytes(tmp_path):
 
 def test_an_asset_immich_has_no_date_for_is_left_unstamped(tmp_path):
     immich = FakeImmichClient(contents={"a1": b"XYZ"})
-    resolver = ByteResolver(immich, scratch=tmp_path / "scratch")
+    resolver = ByteResolver(immich, scratch=tmp_path / "scratch", direct_roots=[tmp_path])
 
     resolved = resolver.resolve(replace(ASSET, taken_at=None))
 

@@ -101,6 +101,66 @@ def _validated(key: str, value: object) -> object | None:
     return None
 
 
+def _is_read_only_mount(path: Path) -> bool:
+    try:
+        return bool(os.statvfs(path).f_flag & os.ST_RDONLY)
+    except (OSError, AttributeError):
+        return False
+
+
+def direct_read_roots(env: Mapping[str, str], data_dirs: tuple[Path, ...] = ()) -> tuple[Path, ...]:
+    """The library roots a direct read may come from.
+
+    `IGP_DIRECT_READ_ROOTS` lists them (separated by `os.pathsep` or commas)
+    -- the Immich upload mount plus any External Library mounts the operator
+    trusts. Unset means Immich's default upload location only
+    (`sync.bytes.DEFAULT_DIRECT_READ_ROOTS`), which is what the documented
+    compose file mounts.
+
+    Each root must be an absolute, existing directory that is mounted
+    read-only (statvfs `ST_RDONLY`) -- the invariant that this service can
+    never write to Immich's library is enforced by the mount, so a writable
+    mount is not trusted for direct reads. `IGP_DIRECT_READ_ALLOW_WRITABLE=
+    true` lifts only that last check (for setups that cannot mount
+    read-only); the service still never writes there. A root that is `/`,
+    or that contains this service's own data or scratch directory, is always
+    refused: it would make credentials readable as "media". A refused root
+    falls back to the Immich API download path, never to an unrestricted
+    read.
+    """
+    from immich_gphotos.sync.bytes import DEFAULT_DIRECT_READ_ROOTS
+
+    raw = env.get("IGP_DIRECT_READ_ROOTS")
+    if raw is None or not raw.strip():
+        candidates: tuple[Path, ...] = DEFAULT_DIRECT_READ_ROOTS
+    else:
+        parts = [p.strip() for chunk in raw.split(",") for p in chunk.split(os.pathsep)]
+        candidates = tuple(Path(p) for p in parts if p)
+    allow_writable = env.get("IGP_DIRECT_READ_ALLOW_WRITABLE", "false").lower() == "true"
+    protected = []
+    for d in data_dirs:
+        try:
+            protected.append(Path(d).resolve(strict=False))
+        except (OSError, RuntimeError):
+            continue
+    roots: list[Path] = []
+    for candidate in candidates:
+        if not candidate.is_absolute():
+            continue
+        try:
+            real = candidate.resolve(strict=True)
+        except (OSError, RuntimeError):
+            continue
+        if not real.is_dir() or real == Path(real.anchor):
+            continue
+        if any(p == real or real in p.parents for p in protected):
+            continue
+        if not allow_writable and not _is_read_only_mount(real):
+            continue
+        roots.append(real)
+    return tuple(roots)
+
+
 def _merged_settings(immich_url: str, stored: object, stored_global: object = None) -> Settings:
     """Apply settings the API has persisted over the dataclass defaults.
 
@@ -228,6 +288,7 @@ def build_account_services(
 
     scratch = Path(env.get("IGP_SCRATCH_DIR") or Path(account_dir) / "scratch")
     allow_direct = env.get("IGP_ALLOW_DIRECT_READS", "true").lower() != "false"
+    direct_roots = direct_read_roots(env, data_dirs=(Path(account_dir), scratch))
 
     runtime, backfill, loops = build_runtime_graph(
         immich=immich,
@@ -240,6 +301,7 @@ def build_account_services(
         clock=clock,
         scratch=scratch,
         allow_direct=allow_direct,
+        direct_roots=direct_roots,
         bandwidth=bandwidth,
         gate=gate,
     )
@@ -263,6 +325,7 @@ def build_account_services(
         redactor=redactor,
         scratch=scratch,
         allow_direct=allow_direct,
+        direct_roots=direct_roots,
         bandwidth=bandwidth,
         gate=gate,
         conn=conn,

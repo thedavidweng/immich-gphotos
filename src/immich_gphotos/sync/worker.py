@@ -14,7 +14,7 @@ from immich_gphotos.gphotos.protocol import GooglePhotosClient, GPhotosError
 from immich_gphotos.models import Asset, AssetState, ErrorClass, Outcome, StoredAsset
 from immich_gphotos.store.assets import AssetRepo
 from immich_gphotos.sync.backoff import next_delay, should_quarantine
-from immich_gphotos.sync.bytes import ByteResolver
+from immich_gphotos.sync.bytes import ByteResolver, SourceChangedError
 from immich_gphotos.sync.eligibility import check_eligibility
 from immich_gphotos.sync.livephoto import LIVE_PHOTO_PAIRED_REASON
 from immich_gphotos.sync.throttle import TokenBucket
@@ -232,6 +232,7 @@ class Worker:
                             content_remote,
                             Outcome.ALREADY_PRESENT,
                             upload_sha1=content_hash,
+                            notes=resolved.notes,
                         )
                         if resolved.paired_video_id is not None:
                             self._mark_paired(resolved.paired_video_id)
@@ -294,11 +295,22 @@ class Worker:
                         media_key = self._gphotos.upload(
                             resolved.path, checksum=content_hash, filename=asset.filename
                         )
+                    if not self._resolver.still_unchanged(resolved):
+                        # A direct-read original was rewritten while gpmc was
+                        # streaming it: what Google received may not be the
+                        # bytes `content_hash` describes. Never record it under
+                        # that hash; retry, which re-hashes and re-checks
+                        # Google read-only before any further upload.
+                        raise SourceChangedError(f"{asset.filename} changed during upload")
                 finally:
                     self._resolver.release(resolved)
 
                 self._assets.mark_synced(
-                    asset.immich_id, media_key, Outcome.UPLOADED, upload_sha1=content_hash
+                    asset.immich_id,
+                    media_key,
+                    Outcome.UPLOADED,
+                    upload_sha1=content_hash,
+                    notes=resolved.notes,
                 )
                 self._star_if_favorited(asset, media_key)
                 if resolved.paired_video_id is not None:

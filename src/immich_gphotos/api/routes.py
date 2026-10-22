@@ -115,6 +115,10 @@ def status_snapshot(services: Services) -> dict[str, Any]:
         # (see `ByteResolver.resolve`), which this does not attempt to
         # predict.
         "direct_reads_enabled": services.allow_direct,
+        # Non-fatal diagnostics on synced rows, by code -- e.g. how many
+        # uploads went up with a capture date nobody could confirm
+        # (`timestamp_unverified`). Counts only; see `AssetRepo.sync_note_counts`.
+        "sync_notes": services.assets.sync_note_counts(),
         # The dashboard's activity feed. It used to append a client-side row
         # reading "status refreshed" on every frame -- a heartbeat dressed as
         # history. These are the real events, already redacted on write by
