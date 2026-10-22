@@ -124,7 +124,13 @@ class BackgroundLoops:
                 "Review the trashed assets in Immich, then re-enable if intended.",
             )
             return
-        if plan.checksums:
+        if getattr(plan, "unverified_ids", None):
+            self._events.add(
+                "warn",
+                f"deletion skipped for {len(plan.unverified_ids)} asset(s) with no verifiable "
+                "Google mapping (synced before upload hashes were recorded); check them by hand.",
+            )
+        if plan.checksums or getattr(plan, "retained_ids", None):
             self._safely("deletion", self._deletion_sweeper.execute, plan)
 
     def _safely(self, label: str, fn, *args) -> None:  # noqa: ANN001

@@ -100,10 +100,13 @@ def test_enabled_sweeper_trashes_in_google_and_marks_the_row(rig):
     for i in range(19):
         sync_asset(assets, f"b{i}")
     trash_asset(assets, "a")
+    # A pre-hashing row (no upload_sha1): its checksum is only used once
+    # Google confirms it maps to exactly this row's recorded item.
+    gphotos.present["sum-a"] = "key-a"
 
     sweeper = DeletionSweeper(gphotos, assets, Settings(deletions_enabled=True))
     plan = sweeper.plan()
-    assert plan.checksums == ["sum-a"]  # rows without upload_sha1 fall back to checksums
+    assert plan.checksums == ["sum-a"]  # verified fallback to the checksum
     assert sweeper.execute(plan) == 1
     assert gphotos.trashed == ["sum-a"]
     stored = assets.get("a")
@@ -142,3 +145,69 @@ def test_blocked_plan_refuses_to_execute(rig):
     assert plan.blocked is True
     assert sweeper.execute(plan) == 0
     assert gphotos.trashed == []
+
+
+def _big_library(assets):
+    for i in range(30):
+        sync_asset(assets, f"b{i}", upload_sha1=f"content-b{i}")
+
+
+def test_a_legacy_row_without_proof_of_its_google_item_is_never_trashed(rig):
+    """External Library rows carry a virtual sha1(path) checksum. With no
+    recorded upload hash and no Google confirmation that the checksum names
+    this row's item, deletion fails closed instead of guessing."""
+    assets, gphotos = rig
+    _big_library(assets)
+    sync_asset(assets, "ext")  # upload_sha1 NULL, checksum unknown to Google
+    trash_asset(assets, "ext")
+    gphotos.present["sum-ext"] = "some-other-item"
+
+    sweeper = DeletionSweeper(gphotos, assets, Settings(deletions_enabled=True))
+    plan = sweeper.plan()
+    assert plan.checksums == []
+    assert plan.unverified_ids == ["ext"]
+    sweeper.execute(plan)
+    assert gphotos.trashed == []
+    assert assets.get("ext").state is AssetState.SYNCED  # left for a human to check
+
+
+def test_an_item_another_live_asset_still_maps_to_is_never_trashed(rig):
+    assets, gphotos = rig
+    _big_library(assets)
+    for i in ("dup1", "dup2"):
+        assets.upsert_pending(asset(i), Priority.WEBHOOK)
+        assets.claim_next(limit=1)
+        assets.mark_synced(i, "shared-key", Outcome.ALREADY_PRESENT, upload_sha1="content-shared")
+    trash_asset(assets, "dup1")
+
+    sweeper = DeletionSweeper(gphotos, assets, Settings(deletions_enabled=True))
+    plan = sweeper.plan()
+    assert plan.checksums == []
+    assert plan.retained_ids == ["dup1"]
+    sweeper.execute(plan)
+    assert gphotos.trashed == []
+    assert assets.get("dup1").ineligible_reason == "deleted_from_immich"
+
+    # Once the last asset mapping to it is trashed too, the item goes.
+    trash_asset(assets, "dup2")
+    plan = sweeper.plan()
+    assert plan.checksums == ["content-shared"]
+    sweeper.execute(plan)
+    assert gphotos.trashed == ["content-shared"]
+
+
+def test_a_derived_motion_photo_added_by_reprocess_is_trashed_with_its_still(rig):
+    assets, gphotos = rig
+    _big_library(assets)
+    sync_asset(assets, "still", upload_sha1="content-still")
+    assets.record_live_photo(
+        "still",
+        "mov",
+        mode="derived_motion",
+        status="complete",
+        derived_sha1="content-derived",
+        derived_media_key="key-derived",
+    )
+    trash_asset(assets, "still")
+    plan = DeletionSweeper(gphotos, assets, Settings(deletions_enabled=True)).plan()
+    assert plan.checksums == ["content-still", "content-derived"]
