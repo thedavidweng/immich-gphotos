@@ -15,7 +15,7 @@ from immich_gphotos.models import Asset, AssetState, ErrorClass, Outcome, Stored
 from immich_gphotos.store.assets import AssetRepo
 from immich_gphotos.sync import livephoto
 from immich_gphotos.sync.backoff import next_delay, should_quarantine
-from immich_gphotos.sync.bytes import ByteResolver, ResolvedBytes, SourceChangedError
+from immich_gphotos.sync.bytes import ByteResolver, ResolvedBytes
 from immich_gphotos.sync.eligibility import check_eligibility
 from immich_gphotos.sync.favorites import FavoriteSyncer
 from immich_gphotos.sync.livephoto import LIVE_PHOTO_PAIRED_REASON, MOTION_NOT_BACKED_UP
@@ -364,22 +364,23 @@ class Worker:
                     # gate protects, so it is the only thing the gate needs
                     # to bound. This is precisely the line a future reader
                     # will try to "tidy" outward -- don't.
+                    # Streamed from a descriptor pinned to the exact file
+                    # that was hashed; the media item is only created if
+                    # the streamed bytes hash to `content_hash` and the
+                    # source is unchanged (see gphotos.stable_upload). A
+                    # racing rewrite therefore fails *before* any Google
+                    # item exists -- no stray item, no post-hoc check that
+                    # could only notice after the fact.
+                    source = self._resolver.upload_source(resolved)
                     if self._gate is not None:
                         with self._gate:
                             media_key = self._gphotos.upload(
-                                resolved.path, checksum=content_hash, filename=asset.filename
+                                resolved.path, checksum=content_hash, filename=asset.filename, source=source
                             )
                     else:
                         media_key = self._gphotos.upload(
-                            resolved.path, checksum=content_hash, filename=asset.filename
+                            resolved.path, checksum=content_hash, filename=asset.filename, source=source
                         )
-                    if not self._resolver.still_unchanged(resolved):
-                        # A direct-read original was rewritten while gpmc was
-                        # streaming it: what Google received may not be the
-                        # bytes `content_hash` describes. Never record it under
-                        # that hash; retry, which re-hashes and re-checks
-                        # Google read-only before any further upload.
-                        raise SourceChangedError(f"{asset.filename} changed during upload")
                 finally:
                     self._resolver.release(resolved)
 

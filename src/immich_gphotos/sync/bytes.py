@@ -60,6 +60,48 @@ def _identity(st: os.stat_result) -> tuple[int, int, int, int]:
     return (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns)
 
 
+_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+_CLOEXEC = getattr(os, "O_CLOEXEC", 0)
+_DIR_FLAGS = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | _NOFOLLOW | _CLOEXEC
+_FILE_FLAGS = os.O_RDONLY | _NOFOLLOW | _CLOEXEC | getattr(os, "O_NONBLOCK", 0)
+
+
+def open_beneath(root: Path, target: Path) -> int:
+    """Open `target` read-only, walking down from `root` one component at a time.
+
+    Race-safe replacement for "resolve, check it is under the root, then
+    open the path": every directory below `root` is opened relative to its
+    parent's descriptor with O_DIRECTORY|O_NOFOLLOW, and the file itself
+    with O_NOFOLLOW, so a parent directory swapped for a symlink *after* the
+    allowlist check makes the open fail (ELOOP/ENOTDIR) instead of silently
+    reading a file elsewhere. `..`, `.` and empty components are refused
+    outright. Only `root` itself (a configured, already-resolved mount
+    point) is opened by path. The result is verified with fstat to be a
+    regular file. Returns a blocking descriptor the caller must close.
+    """
+    rel = target.relative_to(root)  # ValueError when not beneath it
+    parts = rel.parts
+    if not parts or any(part in ("", ".", "..") for part in parts):
+        raise PermissionError(f"refusing to open {target}: not a plain path beneath {root}")
+    dir_fd = os.open(root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | _CLOEXEC)
+    try:
+        for part in parts[:-1]:
+            next_fd = os.open(part, _DIR_FLAGS, dir_fd=dir_fd)
+            os.close(dir_fd)
+            dir_fd = next_fd
+        fd = os.open(parts[-1], _FILE_FLAGS, dir_fd=dir_fd)
+    finally:
+        os.close(dir_fd)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise PermissionError(f"refusing to open {target}: not a regular file")
+        os.set_blocking(fd, True)
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
 def _parse_taken_at(taken_at: str | None) -> float | None:
     """Parse Immich's `fileCreatedAt` to a unix timestamp, or None.
 
@@ -120,27 +162,94 @@ def _sha1_base64_of_file(path: Path) -> str:
     return base64.b64encode(digest.digest()).decode("ascii")
 
 
-def _sha1_base64_of_stable_file(path: Path, expected: tuple[int, int, int, int]) -> str:
+def _sha1_base64_of_stable_file(
+    path: Path, expected: tuple[int, int, int, int], root: Path | None = None
+) -> str:
     """Hash a direct-read original, refusing one that changed underneath us.
 
-    Opened with O_NOFOLLOW (the path is already the resolved real path, so a
-    symlink appearing here means it was swapped after the allowlist check),
-    the open descriptor's identity is compared with the pre-read stat, and
-    the path is stat'ed again after the last byte: a file replaced, appended
-    to or rewritten between check and read raises `SourceChangedError`
-    instead of being hashed as if it were the file that was checked.
+    With `root` (the library root the path was allowed under) the file is
+    opened by `open_beneath`, so no component of the path can have been
+    swapped for a symlink since the allowlist check; without it, O_NOFOLLOW
+    guards the final component only. The open descriptor's identity is
+    compared with the pre-read stat, and the path is re-opened/re-stat'ed
+    after the last byte: a file replaced, appended to or rewritten between
+    check and read raises `SourceChangedError` instead of being hashed as if
+    it were the file that was checked.
     """
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
-    fd = os.open(path, flags)
+    fd = open_beneath(root, path) if root is not None else os.open(path, os.O_RDONLY | _NOFOLLOW)
     with os.fdopen(fd, "rb") as handle:
         if _identity(os.fstat(handle.fileno())) != expected:
             raise SourceChangedError(f"{path.name} changed before it could be read")
         digest = hashlib.sha1()
         for chunk in iter(lambda: handle.read(_HASH_CHUNK), b""):
             digest.update(chunk)
-    if _identity(os.stat(path, follow_symlinks=False)) != expected:
+        if _identity(os.fstat(handle.fileno())) != expected:
+            raise SourceChangedError(f"{path.name} changed while it was being read")
+    if _path_identity(path, root) != expected:
         raise SourceChangedError(f"{path.name} changed while it was being read")
     return base64.b64encode(digest.digest()).decode("ascii")
+
+
+def _copy_from_fd(fd: int, size: int, dest: Path) -> None:
+    """Copy the first `size` bytes of `fd` to a new scratch file `dest`."""
+    with open(dest, "wb") as out:
+        offset = 0
+        while offset < size:
+            chunk = os.pread(fd, min(_HASH_CHUNK, size - offset), offset)
+            if not chunk:
+                raise SourceChangedError(f"{dest.name}: source shrank while it was being copied")
+            out.write(chunk)
+            offset += len(chunk)
+
+
+def _path_identity(path: Path, root: Path | None) -> tuple[int, int, int, int]:
+    """Identity of what `path` names *now*, resolved the same race-safe way."""
+    if root is None:
+        return _identity(os.stat(path, follow_symlinks=False))
+    fd = open_beneath(root, path)
+    try:
+        return _identity(os.fstat(fd))
+    finally:
+        os.close(fd)
+
+
+class _PinnedSource:
+    """`gphotos.protocol.UploadSource` for one resolved file.
+
+    A direct-read original is re-opened beneath its library root and must
+    still be the exact file (dev, inode, size, mtime) that was hashed; a
+    scratch file is opened without following symlinks and pinned to the
+    identity it had when first opened.
+    """
+
+    def __init__(self, resolved: "ResolvedBytes") -> None:
+        self._resolved = resolved
+        self._expected = resolved.source_identity
+
+    def open(self) -> int:
+        r = self._resolved
+        try:
+            if r.direct_root is not None:
+                fd = open_beneath(r.direct_root, r.path)
+            else:
+                fd = os.open(r.path, os.O_RDONLY | _NOFOLLOW | _CLOEXEC)
+        except (OSError, ValueError) as exc:
+            raise SourceChangedError(f"{r.path.name} could not be reopened for upload: {exc}") from exc
+        current = _identity(os.fstat(fd))
+        if self._expected is None:
+            self._expected = current
+        elif current != self._expected:
+            os.close(fd)
+            raise SourceChangedError(f"{r.path.name} is no longer the file that was hashed")
+        return fd
+
+    def unchanged(self, fd: int) -> bool:
+        try:
+            if _identity(os.fstat(fd)) != self._expected:
+                return False
+            return _path_identity(self._resolved.path, self._resolved.direct_root) == self._expected
+        except (OSError, ValueError):
+            return False
 
 
 @dataclass(frozen=True)
@@ -164,6 +273,9 @@ class ResolvedBytes:
     # while gpmc was reading them are never recorded under a hash they no
     # longer have. None for scratch files, which only this process writes.
     source_identity: tuple[int, int, int, int] | None = None
+    # The configured library root a direct read was allowed under; every
+    # later open of `path` walks down from it (`open_beneath`).
+    direct_root: Path | None = None
     # Non-fatal diagnostics about this resolution (e.g. TIMESTAMP_UNVERIFIED).
     notes: tuple[str, ...] = ()
     # Live Photo bookkeeping, only ever set when `resolve` was asked to mux
@@ -273,10 +385,16 @@ class ByteResolver:
             scratch = self._scratch
         if _within(real, scratch):
             return None
-        if not any(_within(real, root) for root in self._direct_roots):
+        if self._root_for(real) is None:
             logger.debug("refusing direct read outside the library roots: %s", real)
             return None
         return real
+
+    def _root_for(self, real: Path) -> Path | None:
+        for root in self._direct_roots:
+            if real != root and _within(real, root):
+                return root
+        return None
 
     def _direct_or_copy(self, candidate: Path, asset: Asset, taken_at: str | None) -> ResolvedBytes:
         """Hand back `candidate` itself when its mtime already agrees with the
@@ -293,36 +411,47 @@ class ByteResolver:
         file -- only that nonce path, never anything in the library -- so a
         long NAS sync cannot fill the disk with orphaned partial copies.
         """
-        before = os.stat(candidate, follow_symlinks=False)
-        identity = _identity(before)
-        when = _parse_taken_at(taken_at)
-        if when is None:
-            return ResolvedBytes(
-                path=candidate, temporary=False, source_identity=identity, notes=(TIMESTAMP_UNVERIFIED,)
-            )
-        if abs(before.st_mtime - when) <= MTIME_TOLERANCE_SECONDS:
-            return ResolvedBytes(path=candidate, temporary=False, source_identity=identity)
-        dest = self._scratch_path(asset)
+        root = self._root_for(candidate)
+        if root is None:
+            raise PermissionError(f"{candidate} is not beneath a library root")
+        fd = open_beneath(root, candidate)
         try:
-            shutil.copyfile(candidate, dest, follow_symlinks=False)
-        except OSError as exc:
-            dest.unlink(missing_ok=True)
-            # The copy is an optimisation for correctness; losing it must
-            # never lose the backup. Fall back to handing back the original:
-            # the upload still happens, dated by Google as before -- and
-            # flagged, so nobody mistakes it for a verified date.
-            logger.debug("could not copy %s to scratch for re-dating: %s", candidate.name, exc)
-            return ResolvedBytes(
-                path=candidate, temporary=False, source_identity=identity, notes=(TIMESTAMP_UNVERIFIED,)
+            before = os.fstat(fd)
+            identity = _identity(before)
+            when = _parse_taken_at(taken_at)
+            direct = ResolvedBytes(
+                path=candidate, temporary=False, source_identity=identity, direct_root=root
             )
-        try:
-            after = os.stat(candidate, follow_symlinks=False)
-        except OSError:
-            dest.unlink(missing_ok=True)
-            raise
-        if _identity(after) != identity:
-            dest.unlink(missing_ok=True)
-            raise SourceChangedError(f"{candidate.name} changed while it was being copied")
+            if when is None:
+                return replace(direct, notes=(TIMESTAMP_UNVERIFIED,))
+            if abs(before.st_mtime - when) <= MTIME_TOLERANCE_SECONDS:
+                return direct
+            dest = self._scratch_path(asset)
+            try:
+                # Copied from the descriptor opened beneath the root, never
+                # by re-opening the path.
+                _copy_from_fd(fd, before.st_size, dest)
+            except SourceChangedError:
+                dest.unlink(missing_ok=True)
+                raise
+            except OSError as exc:
+                dest.unlink(missing_ok=True)
+                # The copy is an optimisation for correctness; losing it must
+                # never lose the backup. Fall back to handing back the original:
+                # the upload still happens, dated by Google as before -- and
+                # flagged, so nobody mistakes it for a verified date.
+                logger.debug("could not copy %s to scratch for re-dating: %s", candidate.name, exc)
+                return replace(direct, notes=(TIMESTAMP_UNVERIFIED,))
+            try:
+                changed = _identity(os.fstat(fd)) != identity or _path_identity(candidate, root) != identity
+            except (OSError, ValueError):
+                dest.unlink(missing_ok=True)
+                raise
+            if changed:
+                dest.unlink(missing_ok=True)
+                raise SourceChangedError(f"{candidate.name} changed while it was being copied")
+        finally:
+            os.close(fd)
         if not _stamp_capture_date(dest, taken_at):
             return ResolvedBytes(path=dest, temporary=True, notes=(TIMESTAMP_UNVERIFIED,))
         return ResolvedBytes(path=dest, temporary=True)
@@ -338,9 +467,13 @@ class ByteResolver:
         if resolved.temporary or resolved.source_identity is None:
             return True
         try:
-            return _identity(os.stat(resolved.path, follow_symlinks=False)) == resolved.source_identity
-        except OSError:
+            return _path_identity(resolved.path, resolved.direct_root) == resolved.source_identity
+        except (OSError, ValueError):
             return False
+
+    def upload_source(self, resolved: ResolvedBytes) -> _PinnedSource:
+        """The pinned descriptor source the uploader must stream from."""
+        return _PinnedSource(resolved)
 
     def resolve(self, asset: Asset, *, mux_live_photo: bool = False) -> ResolvedBytes:
         """Resolve `asset`'s bytes and certify their content SHA-1.
@@ -379,9 +512,12 @@ class ByteResolver:
             return replace(resolved, sha1_b64=_sha1_base64_of_file(resolved.path))
         try:
             return replace(
-                resolved, sha1_b64=_sha1_base64_of_stable_file(resolved.path, resolved.source_identity)
+                resolved,
+                sha1_b64=_sha1_base64_of_stable_file(
+                    resolved.path, resolved.source_identity, resolved.direct_root
+                ),
             )
-        except OSError as exc:
+        except (OSError, ValueError) as exc:
             logger.debug("direct original %s unstable, downloading instead: %s", asset.immich_id, exc)
             downloaded = self._download(asset)
             return replace(downloaded, sha1_b64=_sha1_base64_of_file(downloaded.path))
@@ -552,7 +688,7 @@ class ByteResolver:
                     return self._direct_or_copy(
                         candidate, asset, asset.taken_at or self._lookup_taken_at(asset)
                     )
-                except OSError as exc:
+                except (OSError, ValueError) as exc:
                     logger.debug("direct read of %s failed, downloading: %s", asset.immich_id, exc)
         return self._download(asset)
 

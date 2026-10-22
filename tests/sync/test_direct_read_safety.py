@@ -6,10 +6,11 @@ only from configured roots, and a resolution never leaves an orphaned
 scratch file behind or claims a capture date it did not verify.
 """
 
+import base64
+import hashlib
 import os
-import shutil
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -42,6 +43,10 @@ ASSET = Asset(
     is_trashed=False,
     taken_at=TAKEN,
 )
+
+
+def _b64sha1(data: bytes) -> str:
+    return base64.b64encode(hashlib.sha1(data).digest()).decode()
 
 
 def _library(tmp_path):
@@ -205,12 +210,12 @@ def test_a_copy_that_fails_part_way_leaves_no_scratch_file(tmp_path, monkeypatch
     lib, original = _library(tmp_path)
     os.utime(original, (TAKEN_TS + 86400, TAKEN_TS + 86400))  # drifted: needs a copy
 
-    def half_copy(src, dst, **kwargs):
+    def half_copy(fd, size, dst):
         with open(dst, "wb") as handle:
             handle.write(b"A")
         raise OSError(28, "No space left on device")
 
-    monkeypatch.setattr(shutil, "copyfile", half_copy)
+    monkeypatch.setattr(bytes_mod, "_copy_from_fd", half_copy)
     resolved = _resolver(tmp_path, lib).resolve(replace(ASSET, original_path=str(original)))
     assert _scratch_files(tmp_path) == []
     # The backup still happens, from the original, flagged as undated.
@@ -237,14 +242,14 @@ def test_a_failed_download_leaves_no_partial_scratch_file(tmp_path):
 def test_a_source_changing_during_the_copy_falls_back_to_the_api(tmp_path, monkeypatch):
     lib, original = _library(tmp_path)
     os.utime(original, (TAKEN_TS + 86400, TAKEN_TS + 86400))
-    real_copy = shutil.copyfile
+    real_copy = bytes_mod._copy_from_fd
 
-    def copy_then_mutate(src, dst, **kwargs):
-        real_copy(src, dst, **kwargs)
-        with open(src, "ab") as handle:
+    def copy_then_mutate(fd, size, dst):
+        real_copy(fd, size, dst)
+        with open(original, "ab") as handle:
             handle.write(b"MORE")
 
-    monkeypatch.setattr(shutil, "copyfile", copy_then_mutate)
+    monkeypatch.setattr(bytes_mod, "_copy_from_fd", copy_then_mutate)
     immich = FakeImmichClient(contents={"a1": b"XYZ"})
     resolved = _resolver(tmp_path, lib, immich).resolve(replace(ASSET, original_path=str(original)))
     assert immich.downloads == ["a1"]
@@ -270,7 +275,7 @@ def test_hashing_refuses_a_file_whose_identity_changed(tmp_path):
 def test_a_source_changing_while_being_hashed_falls_back_to_the_api(tmp_path, monkeypatch):
     lib, original = _library(tmp_path)
 
-    def changed(path, expected):
+    def changed(path, expected, root=None):
         raise bytes_mod.SourceChangedError("changed while it was being read")
 
     monkeypatch.setattr(bytes_mod, "_sha1_base64_of_stable_file", changed)
@@ -372,22 +377,155 @@ def test_timestamp_diagnostics_are_persisted_and_counted(tmp_path):
     assert assets.sync_note_counts() == {TIMESTAMP_UNVERIFIED: 1}
 
 
-def test_a_library_file_rewritten_during_upload_is_retried_not_recorded(tmp_path):
+def test_a_library_file_rewritten_during_upload_creates_no_google_item(tmp_path):
+    """The rewrite lands after the bytes were streamed but before the media
+    item would be created: nothing is committed (no stray item), the row is
+    retried, and the retry uploads the new content exactly once."""
     lib, original = _library(tmp_path)
     worker, assets, gphotos = _worker_rig(tmp_path, lib)
-    real_upload = gphotos.upload
+    rewritten = []
 
-    def upload_while_rewritten(path, *, checksum, filename):
-        key = real_upload(path, checksum=checksum, filename=filename)
-        original.write_bytes(b"REWRITTEN-BY-SOMEONE")
-        return key
+    def rewrite(_path):
+        if not rewritten:
+            rewritten.append(True)
+            original.write_bytes(b"REWRITTEN-BY-SOMEONE")
+            os.utime(original, (TAKEN_TS, TAKEN_TS))
 
-    gphotos.upload = upload_while_rewritten
+    gphotos.before_commit = rewrite
     assets.upsert_pending(replace(ASSET, original_path=str(original)), Priority.WEBHOOK)
     result = worker.process(assets.claim_next()[0])
     assert result.state is AssetState.PENDING
     assert result.error_class is ErrorClass.ASSET_UNAVAILABLE
     assert assets.get("a1").media_key is None
+    assert len(gphotos.streamed) == 1
+    assert gphotos.uploads == []  # streamed, never committed: no Google item
+
+    worker._clock.advance(timedelta(days=1))
+    result = worker.process(assets.claim_next()[0])
+    assert result.state is AssetState.SYNCED
+    assert gphotos.uploads == [(_b64sha1(b"REWRITTEN-BY-SOMEONE"), "a.jpg")]
+    assert assets.get("a1").upload_sha1 == _b64sha1(b"REWRITTEN-BY-SOMEONE")
+
+
+def test_a_rewrite_after_the_item_was_created_keeps_that_item(tmp_path):
+    """Once committed, the Google item provably holds the hashed bytes; a
+    later rewrite is a new version, not a reason to upload a second copy."""
+    lib, original = _library(tmp_path)
+    worker, assets, gphotos = _worker_rig(tmp_path, lib)
+    real_upload = gphotos.upload
+
+    def upload_then_rewrite(path, **kwargs):
+        key = real_upload(path, **kwargs)
+        original.write_bytes(b"REWRITTEN-LATER")
+        return key
+
+    gphotos.upload = upload_then_rewrite
+    assets.upsert_pending(replace(ASSET, original_path=str(original)), Priority.WEBHOOK)
+    result = worker.process(assets.claim_next()[0])
+    assert result.state is AssetState.SYNCED
+    assert gphotos.uploads == [(_b64sha1(b"ABC"), "a.jpg")]
+    assert assets.get("a1").upload_sha1 == _b64sha1(b"ABC")
+
+
+def test_bytes_that_do_not_match_the_declared_hash_are_never_committed(tmp_path):
+    from immich_gphotos.gphotos.protocol import SourceChangedDuringUpload
+
+    lib, original = _library(tmp_path)
+    resolver = _resolver(tmp_path, lib)
+    resolved = resolver.resolve(replace(ASSET, original_path=str(original)))
+    gphotos = FakeGooglePhotosClient()
+    with pytest.raises(SourceChangedDuringUpload):
+        gphotos.upload(
+            resolved.path,
+            checksum=_b64sha1(b"OTHER"),
+            filename="a.jpg",
+            source=resolver.upload_source(resolved),
+        )
+    assert gphotos.uploads == []
+
+
+# --- parent-directory symlink swaps --------------------------------------------
+
+
+def _nested_library(tmp_path):
+    lib = tmp_path / "library"
+    album = lib / "2022" / "07"
+    album.mkdir(parents=True)
+    original = album / "a.jpg"
+    original.write_bytes(b"ABC")
+    os.utime(original, (TAKEN_TS, TAKEN_TS))
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    secret = outside / "a.jpg"
+    secret.write_bytes(b"SECRET-OUTSIDE-THE-LIBRARY")
+    os.utime(secret, (TAKEN_TS, TAKEN_TS))
+    return lib, original, outside
+
+
+def _swap_parent_for_symlink(lib, outside):
+    month = lib / "2022" / "07"
+    month.rename(lib / "2022" / "07.moved")
+    month.symlink_to(outside, target_is_directory=True)
+
+
+def test_open_beneath_refuses_a_symlinked_parent(tmp_path):
+    lib, original, outside = _nested_library(tmp_path)
+    fd = bytes_mod.open_beneath(lib, original)
+    os.close(fd)
+    _swap_parent_for_symlink(lib, outside)
+    with pytest.raises(OSError):
+        bytes_mod.open_beneath(lib, original)
+    with pytest.raises(PermissionError):
+        bytes_mod.open_beneath(lib, lib / "2022" / ".." / "2022" / "07.moved" / "a.jpg")
+    with pytest.raises(ValueError):
+        bytes_mod.open_beneath(lib, outside / "a.jpg")
+
+
+def test_a_parent_swapped_after_the_allowlist_check_is_never_read(tmp_path, monkeypatch):
+    lib, original, outside = _nested_library(tmp_path)
+    resolver = _resolver(tmp_path, lib)
+    real = resolver._allowed_direct_path
+
+    def check_then_swap(path):
+        found = real(path)
+        _swap_parent_for_symlink(lib, outside)
+        return found
+
+    monkeypatch.setattr(resolver, "_allowed_direct_path", check_then_swap)
+    resolved = resolver.resolve(replace(ASSET, original_path=str(original)))
+    assert resolved.temporary is True  # fell back to the API download
+    assert resolved.path.read_bytes() == b"XYZ"
+    assert resolved.sha1_b64 == _b64sha1(b"XYZ")
+
+
+def test_a_parent_swapped_between_hashing_and_upload_uploads_nothing(tmp_path):
+    lib, original, outside = _nested_library(tmp_path)
+    worker, assets, gphotos = _worker_rig(tmp_path, lib)
+    real_resolve = worker._resolver.resolve
+
+    def resolve_then_swap(asset, **kwargs):
+        resolved = real_resolve(asset, **kwargs)
+        assert resolved.temporary is False  # a genuine direct read
+        _swap_parent_for_symlink(lib, outside)
+        return resolved
+
+    worker._resolver.resolve = resolve_then_swap
+    assets.upsert_pending(replace(ASSET, original_path=str(original)), Priority.WEBHOOK)
+    result = worker.process(assets.claim_next()[0])
+    assert result.state is AssetState.PENDING
+    assert result.error_class is ErrorClass.ASSET_UNAVAILABLE
+    assert gphotos.streamed == [] and gphotos.uploads == []
+
+
+def test_a_parent_swapped_mid_upload_creates_no_item(tmp_path):
+    lib, original, outside = _nested_library(tmp_path)
+    worker, assets, gphotos = _worker_rig(tmp_path, lib)
+    gphotos.before_commit = lambda _path: _swap_parent_for_symlink(lib, outside)
+    assets.upsert_pending(replace(ASSET, original_path=str(original)), Priority.WEBHOOK)
+    result = worker.process(assets.claim_next()[0])
+    assert result.state is AssetState.PENDING
+    assert len(gphotos.streamed) == 1
+    assert gphotos.uploads == []
 
 
 def test_direct_reads_never_write_to_the_library(tmp_path):
@@ -400,3 +538,17 @@ def test_direct_reads_never_write_to_the_library(tmp_path):
     after = sorted((p.name, p.stat().st_mtime_ns, p.read_bytes()) for p in lib.iterdir())
     assert before == after
     assert _scratch_files(tmp_path) == []
+
+
+def test_an_item_committed_just_before_a_crash_is_reused_not_uploaded_again(tmp_path):
+    """Commit landed, then the process died before the row was marked
+    synced. Google keys items by content SHA-1, which is durable on its
+    side, so the retry finds that item read-only and records it."""
+    lib, original = _library(tmp_path)
+    worker, assets, gphotos = _worker_rig(tmp_path, lib)
+    gphotos.present[_b64sha1(b"ABC")] = "AF1QipFROM-CRASHED-RUN"
+    assets.upsert_pending(replace(ASSET, original_path=str(original)), Priority.WEBHOOK)
+    result = worker.process(assets.claim_next()[0])
+    assert result.state is AssetState.SYNCED
+    assert assets.get("a1").media_key == "AF1QipFROM-CRASHED-RUN"
+    assert gphotos.uploads == [] and gphotos.streamed == []

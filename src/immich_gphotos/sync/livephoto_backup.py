@@ -150,9 +150,12 @@ class LivePhotoCompleter:
         existing = self._gphotos.exists(content_hash)
         if existing:
             return existing, Outcome.ALREADY_PRESENT
-        key = self._gphotos.upload(resolved.path, checksum=content_hash, filename=filename)
-        if not self._resolver.still_unchanged(resolved):
-            raise OSError(f"{filename} changed during upload")
+        key = self._gphotos.upload(
+            resolved.path,
+            checksum=content_hash,
+            filename=filename,
+            source=self._resolver.upload_source(resolved),
+        )
         return key, Outcome.UPLOADED
 
     def _complete_original_pair(self, row, still: StoredAsset, companion: StoredAsset) -> str:  # noqa: ANN001
