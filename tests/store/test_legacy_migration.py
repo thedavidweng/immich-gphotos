@@ -161,3 +161,13 @@ def test_migration_triggers_no_cloud_action(tmp_path):
 def test_no_cloud_guard_really_refuses():
     with pytest.raises(AssertionError):
         NoCloud().trash(["x"])
+
+
+def test_a_database_without_an_asset_table_still_opens(tmp_path):
+    """The control database shares connect(); the legacy UPDATE must not
+    turn into "no such table: asset" there (that would stop the app from
+    starting at all)."""
+    from immich_gphotos.accounts.control import CONTROL_SCHEMA
+
+    for _ in range(2):
+        connect(tmp_path / "control.db", schema=CONTROL_SCHEMA, migrations=()).close()
