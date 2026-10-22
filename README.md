@@ -219,7 +219,7 @@ The normal test suite never touches a real Google or Immich account. Three opt-i
 
 | Suite | Enable with | You provide | Leaves behind |
 |---|---|---|---|
-| `tests/gphotos/test_google_smoke.py` | `IGP_GOOGLE_SMOKE=1` | `IGP_GOOGLE_AUTH_DATA` (the gpmc `auth_data` string of a **throwaway** Google account), `IGP_GOOGLE_SMOKE_STILL` + `IGP_GOOGLE_SMOKE_VIDEO` (a real Live Photo JPEG + its `.MOV`) | Nothing outside Google's trash: the one item it uploads is moved to the Google Photos trash in a `finally` (recoverable for 60 days; gpmc has no permanent delete). It skips rather than touch an item with the same bytes that already existed. |
+| `tests/gphotos/test_google_smoke.py` | `IGP_GOOGLE_SMOKE=1` | `IGP_GOOGLE_AUTH_DATA` (the gpmc `auth_data` string of a **throwaway** Google account), `IGP_GOOGLE_SMOKE_STILL` + `IGP_GOOGLE_SMOKE_VIDEO` (a real Live Photo JPEG + its `.MOV`) | Nothing: the one item it uploads is moved to the Google Photos trash and then deleted permanently from there, in a `finally` so this also happens when an assertion fails. It skips rather than touch an item with the same bytes that already existed. |
 | `tests/immich/test_immich_live.py` | `IGP_IMMICH_LIVE=1` | `IGP_IMMICH_URL`, `IGP_IMMICH_API_KEY` (`asset.read`, `asset.download`), optionally `IGP_IMMICH_LIVE_PHOTO_STILL_ID` | Nothing: read-only requests; downloads go to pytest's temp dir. |
 | `tests/contract/test_immich_openapi.py` | `IGP_CONTRACT_TESTS=1` | network access only | Nothing. |
 

@@ -10,9 +10,9 @@ Skipped unless all of these are set (never in CI):
 It builds a derived JPEG Motion Photo from the pair in a temp dir (the inputs
 are only read), uploads it, checks Google reports it by the derived SHA-1 and
 NOT by the original still's SHA-1, stars and unstars it, then moves it to
-the Google trash -- in a `finally`, so also when an assertion fails. If an
-item with the same bytes already exists the test skips rather than touch
-it. The trash is Google's 60-day bin (gpmc has no permanent delete). Whether
+the Google trash and deletes it permanently from there -- in a `finally`,
+so also when an assertion fails. If an item with the same bytes already
+exists the test skips rather than touch it. Whether
 Google *plays* the motion still has to be checked by eye in the app; this
 test cannot assert that.
 """
@@ -55,8 +55,12 @@ def test_derived_motion_photo_round_trips_by_its_own_hash(tmp_path):
         client.set_favorite(media_key, True)
         client.set_favorite(media_key, False)
     finally:
-        # Cleanup: moves the item to the Google Photos trash (recoverable
-        # there for 60 days; gpmc offers no permanent delete). Runs even
-        # when an assertion above failed.
+        # Cleanup, also when an assertion above failed: trash the one item
+        # this test created, then delete it permanently from the trash
+        # (gpmc's delete_remote_media_permanently, keyed by the same
+        # dedup key move_to_trash uses) so nothing is left in the account.
         client.trash([derived_sha1])
+        from gpmc import utils as gpmc_utils
+
+        client._client.api.delete_remote_media_permanently([gpmc_utils.urlsafe_base64(derived_sha1)])
     assert (still.stat().st_mtime_ns, video.stat().st_mtime_ns) == before
